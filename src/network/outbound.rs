@@ -10,18 +10,18 @@ use bitcoin::{
         message::{NetworkMessage, RawNetworkMessage},
         message_blockdata::Inventory,
         message_network::VersionMessage,
-        Address, ServiceFlags,
+        Address, Magic, ServiceFlags,
     },
-    BlockHash, Network, Transaction, Wtxid,
+    BlockHash, Transaction, Wtxid,
 };
 
 use crate::{network::RelayPolicy, BlockType};
 
-use super::{KYOTO_VERSION, PROTOCOL_VERSION, RUST_BITCOIN_VERSION};
+use super::{p2p_v2, KYOTO_VERSION, PROTOCOL_VERSION, RUST_BITCOIN_VERSION};
 
 // Responsible for serializing messages to write over the wire, either encrypted or plaintext.
 pub(in crate::network) struct MessageGenerator {
-    pub network: Network,
+    pub magic: Magic,
     pub transport: Transport,
     pub block_type: BlockType,
 }
@@ -35,7 +35,7 @@ impl MessageGenerator {
     pub(in crate::network) fn serialize(&mut self, msg: NetworkMessage) -> Vec<u8> {
         match &mut self.transport {
             Transport::V1 => {
-                let data = RawNetworkMessage::new(self.network.magic(), msg);
+                let data = RawNetworkMessage::new(self.magic, msg);
                 serialize(&data)
             }
             Transport::V2 { encryptor } => {
@@ -74,7 +74,7 @@ impl MessageGenerator {
 }
 
 fn serialize_network_message(message: NetworkMessage) -> Vec<u8> {
-    bip324::serde::serialize(message)
+    p2p_v2::serialize(message).expect("in memory serialization cannot fail.")
 }
 
 fn encrypt_plaintext(encryptor: &mut OutboundCipher, plaintext: Vec<u8>) -> Vec<u8> {

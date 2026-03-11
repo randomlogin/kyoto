@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::HashCheckpoint;
 
 use bitcoin::{
-    block::Header, constants::genesis_block, BlockHash, CompactTarget, FilterHash, Network, Work,
+    block::Header, constants::genesis_block, params::Params, BlockHash, CompactTarget, FilterHash,
+    Work,
 };
 
 use super::{FilterCommitment, HeightExt, IndexedHeader, ZerolikeExt};
@@ -96,24 +97,24 @@ pub struct BlockTree {
     headers: HashMap<BlockHash, BlockNode>,
     active_tip: Tip,
     candidate_forks: Vec<Tip>,
-    network: Network,
+    params: Params,
 }
 
 #[allow(unused)]
 impl BlockTree {
-    pub(crate) fn new(tip: impl Into<Tip>, network: Network) -> Self {
+    pub(crate) fn new(tip: impl Into<Tip>, params: Params) -> Self {
         let tip = tip.into();
         Self {
             canonical_hashes: BTreeMap::new(),
             headers: HashMap::with_capacity(20_000),
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
-            network,
+            params,
         }
     }
 
-    pub(crate) fn from_genesis(network: Network) -> Self {
-        let genesis = genesis_block(network);
+    pub(crate) fn from_genesis(params: Params) -> Self {
+        let genesis = genesis_block(params.network);
         let height = 0;
         let hash = genesis.block_hash();
         let tip = Tip {
@@ -127,7 +128,7 @@ impl BlockTree {
             headers,
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
-            network,
+            params,
         }
     }
 
@@ -137,10 +138,9 @@ impl BlockTree {
 
         if self.active_tip.hash.eq(&prev_hash) {
             let new_height = self.active_tip.height.increment();
-            let params = self.network.params();
-            let next_work = if !params.no_pow_retargeting
-                && !params.allow_min_difficulty_blocks
-                && new_height.is_adjustment_multiple(self.network)
+            let next_work = if !self.params.no_pow_retargeting
+                && !self.params.allow_min_difficulty_blocks
+                && new_height.is_adjustment_multiple(&self.params)
             {
                 self.compute_next_work_required(new_height)
             } else {
@@ -186,10 +186,9 @@ impl BlockTree {
             let fork = self.candidate_forks.swap_remove(fork_index);
             if let Some(node) = self.headers.get(&fork.hash) {
                 let new_height = node.height.increment();
-                let params = self.network.params();
-                let next_work = if !params.no_pow_retargeting
-                    && !params.allow_min_difficulty_blocks
-                    && new_height.is_adjustment_multiple(self.network)
+                let next_work = if !self.params.no_pow_retargeting
+                    && !self.params.allow_min_difficulty_blocks
+                    && new_height.is_adjustment_multiple(&self.params)
                 {
                     self.compute_next_work_required(new_height)
                 } else {
@@ -238,10 +237,9 @@ impl BlockTree {
             // A new fork was detected
             Some(node) => {
                 let new_height = node.height.increment();
-                let params = self.network.params();
-                let next_work = if !params.no_pow_retargeting
-                    && !params.allow_min_difficulty_blocks
-                    && new_height.is_adjustment_multiple(self.network)
+                let next_work = if !self.params.no_pow_retargeting
+                    && !self.params.allow_min_difficulty_blocks
+                    && new_height.is_adjustment_multiple(&self.params)
                 {
                     self.compute_next_work_required(new_height)
                 } else {
@@ -312,11 +310,11 @@ impl BlockTree {
         // Do not audit the diffulty for `Testnet`. Auditing the difficulty properly for a testnet
         // will result in convoluted logic. This is a critical code block for mainnet and should be
         // as readable as possible
-        if self.network.params().allow_min_difficulty_blocks {
+        if self.params.allow_min_difficulty_blocks {
             return None;
         }
         let adjustment_period =
-            Height::from_u64_checked(self.network.params().difficulty_adjustment_interval())?;
+            Height::from_u64_checked(self.params.difficulty_adjustment_interval())?;
         let epoch_start = new_height.checked_sub(adjustment_period)?;
         let epoch_end = new_height.checked_sub(1)?;
         let epoch_start_hash = self.canonical_hashes.get(&epoch_start)?;
@@ -326,7 +324,7 @@ impl BlockTree {
         let new_target = CompactTarget::from_header_difficulty_adjustment(
             epoch_start_header,
             epoch_end_header,
-            self.network,
+            &self.params,
         );
         Some(new_target)
     }
@@ -552,7 +550,7 @@ mod tests {
             BlockHash::from_str("62c28f380692524a3a8f1fc66252bc0eb31d6b6a127d2263bdcbee172529fe16")
                 .unwrap(),
         );
-        let mut chain = BlockTree::new(tip, Network::Regtest);
+        let mut chain = BlockTree::new(tip, Params::REGTEST);
         for header in &base {
             let accept = chain.accept_header(header.0);
             assert!(matches!(
@@ -623,7 +621,7 @@ mod tests {
     #[test]
     fn test_depth_two_reorg() {
         let GraphScenario { base, stale, new } = get_graph_scenario(1);
-        let mut chain = BlockTree::from_genesis(Network::Regtest);
+        let mut chain = BlockTree::from_genesis(Params::REGTEST);
         for header in &base {
             let accept = chain.accept_header(header.0);
             assert!(matches!(
@@ -675,7 +673,7 @@ mod tests {
             stale: _,
             new: _,
         } = get_graph_scenario(3);
-        let mut chain = BlockTree::from_genesis(Network::Regtest);
+        let mut chain = BlockTree::from_genesis(Params::REGTEST);
         for header in base.into_iter().map(|hex| hex.0) {
             chain.accept_header(header);
         }

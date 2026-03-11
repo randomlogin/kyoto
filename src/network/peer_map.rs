@@ -8,7 +8,7 @@ use std::{
 use addrman::Record;
 use bitcoin::{
     key::rand,
-    p2p::{address::AddrV2, ServiceFlags},
+    p2p::{address::AddrV2, Magic, ServiceFlags},
     FeeRate, Network, OutPoint, ScriptBuf, Transaction,
 };
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
@@ -72,6 +72,7 @@ pub(crate) struct PeerMap {
     current_id: PeerId,
     network: Network,
     block_type: BlockType,
+    magic: Magic,
     mtx: Sender<PeerThreadMessage>,
     map: HashMap<PeerId, ManagedPeer>,
     gossip: GossipSubscriptionStatus,
@@ -88,6 +89,7 @@ impl PeerMap {
         mtx: Sender<PeerThreadMessage>,
         network: Network,
         block_type: BlockType,
+        magic: Magic,
         whitelist: Whitelist,
         whitelist_only: bool,
         dialog: Arc<Dialog>,
@@ -100,6 +102,7 @@ impl PeerMap {
             current_id: PeerId(0),
             network,
             block_type,
+            magic,
             mtx,
             map: HashMap::new(),
             gossip: GossipSubscriptionStatus::Unsubscribed,
@@ -181,9 +184,9 @@ impl PeerMap {
         let mut peer = Peer::new(
             self.current_id,
             loaded_peer.clone(),
-            self.network,
             self.block_type,
             relay_policy,
+            self.magic,
             self.mtx.clone(),
             prx,
             Arc::clone(&self.dialog),

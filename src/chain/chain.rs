@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use bitcoin::{
     block::Header,
     p2p::message_filter::{CFHeaders, CFilter, GetCFHeaders, GetCFilters},
-    BlockHash, Network,
+    params::Params,
+    BlockHash,
 };
 
 use super::{
@@ -23,14 +24,14 @@ const FILTER_BATCH_SIZE: u32 = 999;
 pub(crate) struct Chain {
     pub(crate) header_chain: BlockTree,
     request_state: FilterRequestState,
-    network: Network,
+    params: Params,
     dialog: Arc<Dialog>,
     filter_type: FilterType,
 }
 
 impl Chain {
     pub(crate) fn new(
-        network: Network,
+        params: Params,
         chain_state: ChainState,
         dialog: Arc<Dialog>,
         quorum_required: u8,
@@ -41,21 +42,21 @@ impl Chain {
                 let mut header_iter = headers.into_iter();
                 match header_iter.next() {
                     Some(header) => {
-                        let mut block_tree = BlockTree::new(header, network);
+                        let mut block_tree = BlockTree::new(header, params.clone());
                         for rest in header_iter {
                             let _ = block_tree.accept_header(rest.header);
                         }
                         block_tree
                     }
-                    None => BlockTree::from_genesis(network),
+                    None => BlockTree::from_genesis(params.clone()),
                 }
             }
-            ChainState::Checkpoint(cp) => BlockTree::new(cp, network),
+            ChainState::Checkpoint(cp) => BlockTree::new(cp, params.clone()),
         };
         Chain {
             header_chain,
             request_state: FilterRequestState::new(quorum_required),
-            network,
+            params,
             dialog,
             filter_type,
         }
@@ -152,7 +153,7 @@ impl Chain {
         if !header_batch.passes_own_pow() {
             return Err(HeaderSyncError::InvalidHeaderWork);
         }
-        if !header_batch.bits_adhere_transition_threshold(self.network) {
+        if !header_batch.bits_adhere_transition_threshold(&self.params) {
             return Err(HeaderSyncError::InvalidBits);
         }
         Ok(())
@@ -428,6 +429,7 @@ mod tests {
         block::Header,
         consensus::deserialize,
         p2p::message_filter::{CFHeaders, CFilter},
+        params::Params,
         BlockHash, FilterHash, FilterHeader,
     };
     use corepc_node::serde_json;
@@ -447,7 +449,7 @@ mod tests {
         let (warn_tx, _) = tokio::sync::mpsc::unbounded_channel::<Warning>();
         let (event_tx, _) = tokio::sync::mpsc::unbounded_channel::<Event>();
         Chain::new(
-            bitcoin::Network::Regtest,
+            Params::REGTEST,
             ChainState::Checkpoint(anchor),
             Arc::new(Dialog::new(info_tx, warn_tx, event_tx)),
             peers,

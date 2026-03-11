@@ -7,7 +7,7 @@ use bitcoin::{
         message_blockdata::GetHeadersMessage,
         message_filter::{CFHeaders, CFilter},
         message_network::VersionMessage,
-        ServiceFlags,
+        Magic, ServiceFlags,
     },
     Block, BlockHash, Network, Wtxid,
 };
@@ -25,7 +25,8 @@ use crate::{
         block_queue::{BlockQueue, ProcessBlockResponse},
         chain::Chain,
         checkpoints::HashCheckpoint,
-        CFHeaderChanges, ChainState, FilterCheck, HeaderSyncEffect, IndexedHeader,
+        params_with_spacing, CFHeaderChanges, ChainState, FilterCheck, HeaderSyncEffect,
+        IndexedHeader,
     },
     error::FetchBlockError,
     messages::ClientRequest,
@@ -74,7 +75,10 @@ impl Node {
             filter_type,
             block_type,
             headers_only_sync,
+            magic,
+            pow_target_spacing,
         } = config;
+        let magic: Magic = magic.unwrap_or_else(|| network.magic());
         // Set up a communication channel between the node and client
         let (info_tx, info_rx) = mpsc::channel::<Info>(32);
         let (warn_tx, warn_rx) = mpsc::unbounded_channel::<Warning>();
@@ -91,6 +95,7 @@ impl Node {
             mtx,
             network,
             block_type,
+            magic,
             white_list,
             whitelist_only,
             Arc::clone(&dialog),
@@ -102,7 +107,7 @@ impl Node {
             HashCheckpoint::from_genesis(network),
         ));
         let chain = Chain::new(
-            network,
+            params_with_spacing(network, pow_target_spacing),
             chain_state,
             Arc::clone(&dialog),
             required_peers,

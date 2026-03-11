@@ -5,7 +5,7 @@ use bitcoin::Network;
 use super::{client::Client, node::Node};
 use crate::chain::ChainState;
 use crate::network::ConnectionType;
-use crate::{BlockType, Config, FilterType};
+use crate::{BlockType, Config, FilterType, Magic};
 use crate::{Socks5Proxy, TrustedPeer};
 
 const MIN_PEERS: u8 = 1;
@@ -153,6 +153,26 @@ impl Builder {
     /// Request witness data when requesting blocks.
     pub fn fetch_witness_data(mut self) -> Self {
         self.config.block_type = BlockType::Witness;
+        self
+    }
+
+    /// Override the P2P network magic bytes.
+    ///
+    /// Useful for custom signets whose `signetchallenge` produces magic bytes
+    /// different from `bitcoin::Network::Signet`'s hardcoded value.
+    /// If not set, the magic is derived from the `Network` passed to [`Builder::new`].
+    pub fn custom_magic(mut self, magic: Magic) -> Self {
+        self.config.magic = Some(magic);
+        self
+    }
+
+    /// Override the target time between blocks.
+    ///
+    /// Useful for custom signets whose `signetchallenge` sets a block spacing, like Mutinynet's
+    /// 30 seconds. The difficulty adjustment timespan scales with it, as in Bitcoin Core.
+    /// If not set, the spacing of the `Network` passed to [`Builder::new`] is used.
+    pub fn pow_target_spacing(mut self, spacing: Duration) -> Self {
+        self.config.pow_target_spacing = Some(spacing);
         self
     }
 

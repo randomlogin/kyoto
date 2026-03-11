@@ -4,11 +4,8 @@ use std::{sync::Arc, time::Duration};
 use addrman::Record;
 use bip324::futures::{Protocol, ProtocolReader};
 use bip324::{OutboundCipher, Role};
+use bitcoin::p2p::{message::NetworkMessage, message_blockdata::Inventory, Magic, ServiceFlags};
 use bitcoin::BlockHash;
-use bitcoin::{
-    p2p::{message::NetworkMessage, message_blockdata::Inventory, ServiceFlags},
-    Network,
-};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -41,8 +38,8 @@ pub(crate) struct Peer {
     source: Record,
     main_thread_sender: Sender<PeerThreadMessage>,
     main_thread_recv: Receiver<MainThreadMessage>,
-    network: Network,
     block_type: BlockType,
+    magic: Magic,
     dialog: Arc<Dialog>,
     db: Arc<Mutex<AddressBook>>,
     timeout_config: PeerTimeoutConfig,
@@ -56,9 +53,9 @@ impl Peer {
     pub(crate) fn new(
         nonce: PeerId,
         source: Record,
-        network: Network,
         block_type: BlockType,
         relay_policy: RelayPolicy,
+        magic: Magic,
         main_thread_sender: Sender<PeerThreadMessage>,
         main_thread_recv: Receiver<MainThreadMessage>,
         dialog: Arc<Dialog>,
@@ -71,9 +68,9 @@ impl Peer {
             source,
             main_thread_sender,
             main_thread_recv,
-            network,
             block_type,
             relay_policy,
+            magic,
             dialog,
             db,
             timeout_config,
@@ -104,7 +101,7 @@ impl Peer {
                 let (protocol_reader, encryptor, w) = handshake_result?;
                 writer = w;
                 let outbound_messages = MessageGenerator {
-                    network: self.network,
+                    magic: self.magic,
                     transport: Transport::V2 { encryptor },
                     block_type: self.block_type,
                 };
@@ -112,11 +109,11 @@ impl Peer {
                 (outbound_messages, reader)
             } else {
                 let outbound_messages = MessageGenerator {
-                    network: self.network,
+                    magic: self.magic,
                     transport: Transport::V1,
                     block_type: self.block_type,
                 };
-                let reader = Reader::new(MessageParser::V1(reader, self.network), tx);
+                let reader = Reader::new(MessageParser::V1(reader, self.magic), tx);
                 (outbound_messages, reader)
             };
 
@@ -516,7 +513,9 @@ impl Peer {
         R: AsyncRead + Send + Unpin,
     {
         crate::debug!("Initiating a handshake for encrypted messaging");
-        match Protocol::new(self.network, Role::Initiator, None, None, reader, writer).await {
+        // The magic feeds the key derivation, so it must match the peer's, custom or not.
+        let magic = self.magic.to_bytes();
+        match Protocol::new(magic, Role::Initiator, None, None, reader, writer).await {
             Ok(protocol) => {
                 crate::debug!("Established an encrypted connection");
                 let (protocol_reader, protocol_writer) = protocol.into_split();

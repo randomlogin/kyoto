@@ -12,13 +12,14 @@ pub(crate) mod error;
 pub(crate) mod graph;
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bitcoin::constants::SUBSIDY_HALVING_INTERVAL;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::Amount;
 use bitcoin::{
     bip158::BlockFilter, block::Header, p2p::message_filter::CFHeaders, params::Params, BlockHash,
-    FilterHash, FilterHeader, ScriptBuf, Target, Work,
+    FilterHash, FilterHeader, Network, ScriptBuf, Target, Work,
 };
 
 use crate::network::PeerId;
@@ -355,6 +356,23 @@ impl HeaderValidationExt for &[Header] {
             Target::from_compact(second.bits).le(&transition)
         })
     }
+}
+
+// The consensus parameters of `network`, optionally with a different target time between blocks.
+// Custom signets can choose their own spacing. As in Bitcoin Core, the adjustment timespan scales
+// with it, so a difficulty adjustment still happens every `difficulty_adjustment_interval` blocks.
+pub(crate) fn params_with_spacing(network: Network, spacing: Option<Duration>) -> Params {
+    let mut params = Params::new(network);
+    if let Some(spacing) = spacing {
+        let seconds = spacing.as_secs();
+        assert!(
+            seconds > 0,
+            "the target block spacing must be at least a second"
+        );
+        params.pow_target_timespan = seconds * params.difficulty_adjustment_interval();
+        params.pow_target_spacing = seconds;
+    }
+    params
 }
 
 // Emulation of `GetBlockSubsidy` in Bitcoin Core: https://github.com/bitcoin/bitcoin/blob/master/src/validation.cpp#L1944

@@ -8,7 +8,7 @@ use std::{
 use addrman::Record;
 use bitcoin::{
     key::rand,
-    p2p::{address::AddrV2, ServiceFlags},
+    p2p::{address::AddrV2, Magic, ServiceFlags},
     FeeRate, Network, OutPoint, ScriptBuf, Transaction,
 };
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
@@ -90,6 +90,7 @@ pub(crate) struct PeerMap {
     current_id: PeerId,
     network: Network,
     block_type: BlockType,
+    magic: Magic,
     mtx: Sender<PeerThreadMessage>,
     map: HashMap<PeerId, ManagedPeer>,
     gossip: GossipSubscriptionStatus,
@@ -106,6 +107,7 @@ impl PeerMap {
         mtx: Sender<PeerThreadMessage>,
         network: Network,
         block_type: BlockType,
+        magic: Magic,
         whitelist: Whitelist,
         whitelist_only: bool,
         dialog: Arc<Dialog>,
@@ -118,6 +120,7 @@ impl PeerMap {
             current_id: PeerId(0),
             network,
             block_type,
+            magic,
             mtx,
             map: HashMap::new(),
             gossip: GossipSubscriptionStatus::Unsubscribed,
@@ -199,9 +202,9 @@ impl PeerMap {
         let mut peer = Peer::new(
             self.current_id,
             loaded_peer.clone(),
-            self.network,
             self.block_type,
             relay_policy,
+            self.magic,
             self.mtx.clone(),
             prx,
             Arc::clone(&self.dialog),
@@ -305,7 +308,8 @@ impl PeerMap {
     }
 
     // Pull a peer from the configuration if we have one. If not, select a random peer from the database,
-    // as long as it is not from the same netgroup. If there are no peers in the database, try DNS.
+    // as long as it is not from the same netgroup. If there are no peers in the database, try DNS,
+    // unless custom magic bytes are set.
     // When `whitelist_only` is set, only whitelist peers are used.
     pub async fn next_peer(&mut self) -> Option<Record> {
         while let Some(peer) = self.whitelist.pop() {
@@ -372,7 +376,9 @@ impl PeerMap {
             return None;
         }
         let mut db_lock = self.db.lock().await;
-        if db_lock.is_empty() {
+        // The DNS seeds serve the default network, so they are useless with custom magic bytes.
+        // Peers are discovered through address gossip instead.
+        if db_lock.is_empty() && self.magic == self.network.magic() {
             crate::debug!("Bootstrapping peers with DNS");
             let new_peers = bootstrap_dns(self.network, &self.connector)
                 .await

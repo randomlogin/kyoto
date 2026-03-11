@@ -36,6 +36,7 @@ pub(crate) mod error;
 pub(crate) mod gossip;
 pub(crate) mod inbound;
 pub(crate) mod outbound;
+pub(crate) mod p2p_v2;
 pub(crate) mod peer;
 pub(crate) mod peer_map;
 pub(crate) mod reader;

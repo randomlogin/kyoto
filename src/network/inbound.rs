@@ -1,19 +1,20 @@
 use bip324::futures::ProtocolReader;
-use bip324::serde::NetworkMessage;
 use bip324::PacketType;
 use bitcoin::consensus::{deserialize, deserialize_partial};
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message::RawNetworkMessage;
-use bitcoin::Network;
+use bitcoin::p2p::Magic;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::error::ReaderError;
+use super::p2p_v2;
 use super::V1Header;
 
 const MAX_MESSAGE_BYTES: u32 = 1024 * 1024 * 32;
 
 pub(crate) enum MessageParser<R: AsyncRead + Send + Sync + Unpin> {
     V2(ProtocolReader<R>),
-    V1(R, Network),
+    V1(R, Magic),
 }
 
 impl<R: AsyncRead + Send + Sync + Unpin> MessageParser<R> {
@@ -23,18 +24,18 @@ impl<R: AsyncRead + Send + Sync + Unpin> MessageParser<R> {
                 let payload = reader.read().await?;
                 match payload.packet_type() {
                     PacketType::Genuine => {
-                        let parsed = bip324::serde::deserialize(payload.contents())?;
+                        let parsed = p2p_v2::deserialize(payload.contents())?;
                         Ok(Some(parsed))
                     }
                     PacketType::Decoy => Ok(None),
                 }
             }
-            MessageParser::V1(stream, network) => {
+            MessageParser::V1(stream, magic) => {
                 let mut message_buf = vec![0_u8; 24];
                 let _ = stream.read_exact(&mut message_buf).await?;
                 let header: V1Header = deserialize_partial(&message_buf)?.0;
                 // Nonsense for our network
-                if header.magic != network.magic() {
+                if header.magic != *magic {
                     return Err(ReaderError::InvalidDeserialization);
                 }
                 // Message is too long

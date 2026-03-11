@@ -4,11 +4,8 @@ use std::{io, sync::Arc, time::Duration};
 use addrman::Record;
 use bip324::futures::{Protocol, ProtocolReader};
 use bip324::{OutboundCipher, Role};
+use bitcoin::p2p::{message::NetworkMessage, message_blockdata::Inventory, Magic, ServiceFlags};
 use bitcoin::BlockHash;
-use bitcoin::{
-    p2p::{message::NetworkMessage, message_blockdata::Inventory, ServiceFlags},
-    Network,
-};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -48,8 +45,8 @@ pub(crate) struct Peer {
     source: Record,
     main_thread_sender: Sender<PeerThreadMessage>,
     main_thread_recv: Receiver<MainThreadMessage>,
-    network: Network,
     block_type: BlockType,
+    magic: Magic,
     dialog: Arc<Dialog>,
     db: Arc<Mutex<AddressBook>>,
     timeout_config: PeerTimeoutConfig,
@@ -63,9 +60,9 @@ impl Peer {
     pub(crate) fn new(
         nonce: PeerId,
         source: Record,
-        network: Network,
         block_type: BlockType,
         relay_policy: RelayPolicy,
+        magic: Magic,
         main_thread_sender: Sender<PeerThreadMessage>,
         main_thread_recv: Receiver<MainThreadMessage>,
         dialog: Arc<Dialog>,
@@ -78,9 +75,9 @@ impl Peer {
             source,
             main_thread_sender,
             main_thread_recv,
-            network,
             block_type,
             relay_policy,
+            magic,
             dialog,
             db,
             timeout_config,
@@ -112,7 +109,7 @@ impl Peer {
                 let (protocol_reader, encryptor, w) = handshake_result?;
                 writer = w;
                 let outbound_messages = MessageGenerator {
-                    network: self.network,
+                    magic: self.magic,
                     transport: Transport::V2 { encryptor },
                     block_type: self.block_type,
                 };
@@ -120,11 +117,11 @@ impl Peer {
                 (outbound_messages, reader)
             } else {
                 let outbound_messages = MessageGenerator {
-                    network: self.network,
+                    magic: self.magic,
                     transport: Transport::V1,
                     block_type: self.block_type,
                 };
-                let reader = Reader::new(MessageParser::V1(reader, self.network), tx);
+                let reader = Reader::new(MessageParser::V1(reader, self.magic), tx);
                 (outbound_messages, reader)
             };
 
@@ -525,7 +522,9 @@ impl Peer {
         R: AsyncRead + Send + Unpin,
     {
         crate::debug!("Initiating a handshake for encrypted messaging");
-        match Protocol::new(self.network, Role::Initiator, None, None, reader, writer).await {
+        // The magic feeds the key derivation, so it must match the peer's, custom or not.
+        let magic = self.magic.to_bytes();
+        match Protocol::new(magic, Role::Initiator, None, None, reader, writer).await {
             Ok(protocol) => {
                 crate::debug!("Established an encrypted connection");
                 let (protocol_reader, protocol_writer) = protocol.into_split();
@@ -545,8 +544,9 @@ mod tests {
         constants::genesis_block,
         hashes::Hash,
         p2p::{address::AddrV2, message::RawNetworkMessage, message_filter::CFHeaders},
+        params::Params,
         transaction::Version,
-        Amount, FilterHash, FilterHeader, OutPoint, ScriptBuf, Transaction, TxIn, TxOut,
+        Amount, FilterHash, FilterHeader, Network, OutPoint, ScriptBuf, Transaction, TxIn, TxOut,
     };
 
     use super::*;
@@ -565,9 +565,9 @@ mod tests {
         let mut peer = Peer::new(
             PeerId(id),
             Record::new_from_addrv2_source(address.clone(), 18444, ServiceFlags::NONE, &address),
-            Network::Regtest,
             BlockType::Witness,
             RelayPolicy::BlocksOnly,
+            Network::Regtest.magic(),
             to_node,
             from_node,
             Arc::new(Dialog::new(info_tx, warn_tx, event_tx)),
@@ -622,7 +622,7 @@ mod tests {
             callback,
         );
         let mut generator = MessageGenerator {
-            network: Network::Regtest,
+            magic: Network::Regtest.magic(),
             transport: Transport::V1,
             block_type: BlockType::Witness,
         };
@@ -670,7 +670,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
         let mut chain = Chain::new(
-            network,
+            Params::REGTEST,
             ChainState::Snapshot(vec![]),
             dialog.clone(),
             1,
@@ -683,9 +683,9 @@ mod tests {
         let mut peer = Peer::new(
             PeerId(1),
             Record::new_from_addrv2_source(address.clone(), 18444, services, &address),
-            network,
             BlockType::Legacy,
             RelayPolicy::BlocksOnly,
+            network.magic(),
             to_node,
             from_node,
             dialog,
@@ -695,7 +695,7 @@ mod tests {
         );
         peer.message_state.finish_version_handshake();
         let mut generator = MessageGenerator {
-            network,
+            magic: network.magic(),
             transport: Transport::V1,
             block_type: BlockType::Legacy,
         };

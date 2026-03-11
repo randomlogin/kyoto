@@ -1,7 +1,7 @@
 use crate::impl_sourceless_error;
 
+use super::p2p_v2;
 use bip324::io::ProtocolError;
-use bip324::serde;
 use bitcoin::consensus::encode;
 use tokio::io;
 use tokio::sync::mpsc;
@@ -49,8 +49,8 @@ impl From<encode::Error> for ReaderError {
     }
 }
 
-impl From<serde::Error> for ReaderError {
-    fn from(_value: serde::Error) -> Self {
+impl From<p2p_v2::Error> for ReaderError {
+    fn from(_value: p2p_v2::Error) -> Self {
         Self::InvalidDeserialization
     }
 }
@@ -74,7 +74,7 @@ impl From<ProtocolError> for ReaderError {
 pub(crate) enum PeerError {
     ConnectionFailed,
     Encryption(bip324::Error),
-    Serialization(serde::Error),
+    Serialization(p2p_v2::Error),
     HandshakeFailed,
     Io(io::Error),
     ChannelClosed,
@@ -136,8 +136,8 @@ impl From<bip324::Error> for PeerError {
     }
 }
 
-impl From<serde::Error> for PeerError {
-    fn from(value: serde::Error) -> Self {
+impl From<p2p_v2::Error> for PeerError {
+    fn from(value: p2p_v2::Error) -> Self {
         Self::Serialization(value)
     }
 }

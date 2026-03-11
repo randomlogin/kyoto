@@ -15,7 +15,7 @@ rust-version = "1.84.0"
 bitcoin = { version = "0.32.8", default-features = false, features = [
     "rand-std",
 ] }
-bip324 = { version = "0.10.0", default-features = false, features = [
+bip324 = { version = "0.11.0", default-features = false, features = [
     "tokio",
 ] }
 hashes = { package = "bitcoin_hashes", version = "1.0.0" }

@@ -67,6 +67,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 // Re-exports
@@ -91,8 +92,8 @@ pub use {
 
 #[doc(inline)]
 pub use bitcoin::{
-    bip158::BlockFilter, block::Header, p2p::address::AddrV2, p2p::ServiceFlags, Block, BlockHash,
-    FeeRate, Network, ScriptBuf, Transaction, Wtxid,
+    bip158::BlockFilter, block::Header, p2p::address::AddrV2, p2p::Magic, p2p::ServiceFlags, Block,
+    BlockHash, FeeRate, Network, ScriptBuf, Transaction, Wtxid,
 };
 
 pub extern crate tokio;
@@ -397,6 +398,8 @@ struct Config {
     filter_type: FilterType,
     block_type: BlockType,
     headers_only_sync: bool,
+    magic: Option<bitcoin::p2p::Magic>,
+    pow_target_spacing: Option<Duration>,
 }
 
 impl Default for Config {
@@ -411,6 +414,8 @@ impl Default for Config {
             filter_type: FilterType::default(),
             block_type: BlockType::default(),
             headers_only_sync: Default::default(),
+            magic: None,
+            pow_target_spacing: None,
         }
     }
 }

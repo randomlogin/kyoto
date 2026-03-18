@@ -638,3 +638,49 @@ async fn dns_works() {
     let hostname = bip157::lookup_host("seed.bitcoin.sipa.be").await;
     assert!(!hostname.is_empty());
 }
+
+/// With a small address book check if all peers are tried before failing: known and new ones.
+#[tokio::test]
+async fn whitelist_peer_reconnects_after_disconnect() {
+    let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();
+    let rpc = &bitcoind.client;
+    let miner = rpc.new_address().unwrap();
+    mine_blocks(rpc, &miner, 1, 1).await;
+
+    let tempdir = tempfile::TempDir::new().unwrap().path().to_owned();
+    let host = (IpAddr::V4(*socket_addr.ip()), Some(socket_addr.port()));
+
+    let (node, client) = bip157::Builder::new(bitcoin::Network::Regtest)
+        .add_peer(host)
+        .data_dir(tempdir)
+        .maximum_connection_time(Duration::from_secs(2))
+        .build();
+
+    let bip157::Client {
+        requester: _,
+        mut info_rx,
+        warn_rx: _,
+        event_rx: _,
+    } = client;
+    tokio::task::spawn(async move { node.run().await });
+
+    const CYCLES: usize = 7;
+    for cycle in 0..CYCLES {
+        let reconnected = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(info) = info_rx.recv().await {
+                if matches!(info, Info::ConnectionsMet) {
+                    return true;
+                }
+            }
+            false // node exited without reconnecting
+        })
+        .await
+        .unwrap_or(false);
+
+        assert!(
+            reconnected,
+            "kyoto exited after {} successful cycle(s) instead of reconnecting to the whitelisted peer",
+            cycle
+        );
+    }
+}

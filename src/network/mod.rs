@@ -515,7 +515,7 @@ impl AddressBook {
     }
 
     pub(crate) fn select(&self) -> Option<Record> {
-        // ensures we try all variants
+        // ensures we use known peers if there are no new peers
         if rand::random() {
             self.tried.select().or_else(|| self.new.select())
         } else {

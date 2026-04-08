@@ -370,6 +370,10 @@ impl Node {
     // requested next.
     async fn next_stateful_message(&mut self) -> Option<MainThreadMessage> {
         if self.state == NodeState::Behind {
+            println!(
+                "next_stateful_message: GetHeaders (chain_height={})",
+                self.chain.header_chain.height()
+            );
             let headers = GetHeadersMessage {
                 version: WTXID_VERSION,
                 locator_hashes: self.chain.header_chain.locators(),
@@ -377,13 +381,20 @@ impl Node {
             };
             return Some(MainThreadMessage::GetHeaders(headers));
         } else if !self.chain.is_cf_headers_synced() {
-            return Some(MainThreadMessage::GetFilterHeaders(
-                self.chain.next_cf_header_message(),
-            ));
+            let a = self.chain.next_cf_header_message();
+            println!("next_stateful_message: GetFilterHeaders) {:?}", a);
+            return Some(MainThreadMessage::GetFilterHeaders(a));
+
+            // return Some(MainThreadMessage::GetFilterHeaders(
+            //     self.chain.next_cf_header_message(),
+            // ));
         } else if !self.chain.is_filters_synced() {
-            return Some(MainThreadMessage::GetFilters(
-                self.chain.next_filter_message(),
-            ));
+            let a = self.chain.next_filter_message();
+            println!("next_stateful_message: GetFilter) {:?}", a);
+            return Some(MainThreadMessage::GetFilters(a));
+            // return Some(MainThreadMessage::GetFilters(
+            //     self.chain.next_filter_message(),
+            // ));
         }
         None
     }
@@ -472,6 +483,7 @@ impl Node {
                 }
             },
             Err(e) => {
+                println!("in handle headers, e: {:?}", e);
                 self.dialog.send_warning(Warning::UnexpectedSyncError {
                     warning: format!("Unexpected header syncing error: {e}"),
                 });

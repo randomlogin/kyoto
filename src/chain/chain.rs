@@ -85,6 +85,7 @@ impl Chain {
                 .expect("non-empty check above.")
                 .block_hash(),
         ) {
+            println!("sync_chain: already have last header , returning empty");
             return Ok(HeaderSyncEffect::Empty);
         }
         // We check first if the peer is sending us nonsense
@@ -291,6 +292,7 @@ impl Chain {
             start_height: last_unchecked_cfheader,
             stop_hash,
         });
+        println!("GetCFHeaders request: start={last_unchecked_cfheader}, stop_hash={stop_hash}, tip_height={}", self.header_chain.height());
         GetCFHeaders {
             filter_type: self.filter_type.into(),
             start_height: last_unchecked_cfheader,
@@ -308,7 +310,9 @@ impl Chain {
         &mut self,
         filter_message: CFilter,
     ) -> Result<FilterCheck, CFilterSyncError> {
+        crate::debug!(format!("In sync filter got message {:?}", &filter_message));
         let filter = Filter::new(filter_message.filter, filter_message.block_hash);
+
         if self
             .header_chain
             .is_filter_checked(&filter_message.block_hash)
@@ -368,6 +372,7 @@ impl Chain {
             stop_hash,
             start_height: last_unchecked_filter,
         });
+        println!("GetCFilters request: start={last_unchecked_filter}, stop_hash={stop_hash}, tip_height={}", self.header_chain.height());
         GetCFilters {
             filter_type: self.filter_type.into(),
             start_height: last_unchecked_filter,

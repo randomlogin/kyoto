@@ -122,6 +122,7 @@ impl Peer {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             if read_handle.is_finished() {
+                println!(">>> DISCONNECT: reader finished (remote closed connection)");
                 return Ok(());
             }
             if let Some(nonce) = self.message_state.ping_state.send_ping() {
@@ -133,10 +134,21 @@ impl Peer {
                     .insert(msg_id, Instant::now());
             }
             if self.message_state.unresponsive() {
+                // println!(">>> DISCONNECT: unresp, filter_rate: {:?}");
+                println!(
+                    ">>> DISCONNECT: unresponsive, stale entries: {:?}",
+                    self.message_state.timed_message_state
+                );
+
                 self.dialog.send_warning(Warning::PeerTimedOut);
                 return Ok(());
             }
             if self.message_state.filter_rate.slow_peer() {
+                // println!(">>> DISCONNECT: slow_peer, filter_rate: {:?}");
+                println!(
+                    ">>> DISCONNECT: slow_peer, filter_rate: {:?}",
+                    self.message_state.filter_rate
+                );
                 self.dialog.send_warning(Warning::PeerTimedOut);
                 return Ok(());
             }
@@ -157,7 +169,10 @@ impl Peer {
                                 Err(e) => {
                                     match e {
                                         // We were told by the reader thread to disconnect from this peer
-                                        PeerError::DisconnectCommand => return Ok(()),
+                                        PeerError::DisconnectCommand => {
+                                            println!(">>> DISCONNECT: DisconnectCommand from handle_peer_message");
+                                            return Ok(());
+                                        }
                                         _ => continue,
                                     }
                                 },
@@ -175,7 +190,10 @@ impl Peer {
                                 Err(e) => {
                                     match e {
                                         // We were told by the main thread to disconnect from this peer
-                                        PeerError::DisconnectCommand => return Ok(()),
+                                        PeerError::DisconnectCommand => {
+                                            println!(">>> DISCONNECT: DisconnectCommand from main_thread_request");
+                                            return Ok(());
+                                        }
                                         _ => continue,
                                     }
                                 },

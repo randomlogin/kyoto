@@ -30,6 +30,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(corepc_node::Node, SocketAddrV4)> {
     let path = exe_path()?;
     let mut conf = corepc_node::Conf::default();
+
     conf.p2p = corepc_node::P2P::Yes;
     conf.args.push("--txindex");
     conf.args.push("--blockfilterindex");
@@ -37,8 +38,12 @@ fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(corepc_node::Node,
     conf.args.push("--rest=1");
     conf.args.push("--server=1");
     conf.args.push("--listen=1");
-    let tempdir = tempfile::TempDir::new()?;
-    conf.tmpdir = Some(tempdir.path().to_owned());
+    let mut tempdir = tempfile::TempDir::new()?;
+    tempdir.disable_cleanup(true);
+    println!("bitcoind datadir {:?}", &tempdir);
+    //we want to keep logs, so it's a staticdir
+    conf.staticdir = Some(tempdir.keep());
+    // conf.tmpdir = Some(tempdir.keep());
     if with_v2_transport {
         conf.args.push("--v2transport=1")
     } else {
@@ -84,7 +89,7 @@ async fn mine_blocks(
 async fn invalidate_block(rpc: &corepc_node::Client, hash: &bitcoin::BlockHash) {
     let value = serde_json::to_value(hash).unwrap();
     rpc.call::<()>("invalidateblock", &[value]).unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // tokio::time::sleep(Duration::from_secs(2)).await;
 }
 
 async fn sync_assert(best: &bitcoin::BlockHash, channel: &mut UnboundedReceiver<Event>) {
@@ -694,6 +699,226 @@ async fn whitelist_only_sync() {
     let (node, _client) = builder.build();
     let result = node.run().await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn live_reorg_with_filters_in_flight() {
+    let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();
+    let rpc = &bitcoind.client;
+    let mut tempdir = tempfile::TempDir::new().unwrap();
+    tempdir.disable_cleanup(true);
+    let miner = rpc.new_address().unwrap();
+    // mine_blocks(rpc, &miner, 1100, 0).await;
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    let old_best = best_hash(rpc);
+    let (node, client) = new_node(
+        socket_addr,
+        tempdir.keep(),
+        ChainState::Checkpoint(HeaderCheckpoint::from_genesis(bitcoin::Network::Regtest)),
+    );
+    let node_handle = tokio::task::spawn(async move { node.run().await });
+    let Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx: mut channel,
+    } = client;
+    tokio::task::spawn(async move { print_logs(info_rx, warn_rx).await });
+
+    loop {
+        if let Some(Event::IndexedFilter(_)) = channel.recv().await {
+            break;
+        }
+    }
+    println!("before invalidation");
+    invalidate_block(rpc, &old_best).await;
+    println!("block invalidated");
+    let miner2 = rpc.new_address().unwrap();
+    mine_blocks(rpc, &miner2, 4, 0).await;
+    let best = best_hash(rpc);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = async {
+                loop {
+                    if let Some(Event::FiltersSynced(update)) = channel.recv().await {
+                        if update.tip().hash == best {
+                            break;
+                        }
+                    }
+                }
+            } => {}
+            result = node_handle => {
+                let node_result = result.expect("node task panicked");
+                if let Err(e) = node_result {
+                    panic!("node died before syncing: {e}");
+                }
+            }
+        }
+    })
+    .await
+    .expect("node failed to sync to tip — likely banned its only peer");
+    requester.shutdown().unwrap();
+    rpc.stop().unwrap();
+}
+
+//results in infinite loop of trying to get non-existant header
+#[tokio::test]
+async fn reorg_during_filter_same_peer_twice() {
+    let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();
+    let rpc = &bitcoind.client;
+    let tempdir = tempfile::TempDir::new().unwrap().path().to_owned();
+    let miner = rpc.new_address().unwrap();
+    // Mine enough blocks so that filter sync takes a while
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    let old_best = best_hash(rpc);
+    let host = (IpAddr::V4(*socket_addr.ip()), Some(socket_addr.port()));
+    let builder = bip157::builder::Builder::new(bitcoin::Network::Regtest)
+        .chain_state(ChainState::Checkpoint(HeaderCheckpoint::from_genesis(
+            bitcoin::Network::Regtest,
+        )))
+        .add_peer(host)
+        .add_peer(host)
+        .required_peers(2)
+        .data_dir(tempdir);
+    let (node, client) = builder.build();
+    let node_handle = tokio::task::spawn(async move { node.run().await });
+    let Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx: mut channel,
+    } = client;
+    tokio::task::spawn(async move { print_logs(info_rx, warn_rx).await });
+    // Wait until the node has started receiving filters
+    loop {
+        if let Some(Event::IndexedFilter(_)) = channel.recv().await {
+            break;
+        }
+    }
+    // Trigger a reorg while filters are in flight
+    invalidate_block(rpc, &old_best).await;
+    let miner2 = rpc.new_address().unwrap();
+    mine_blocks(rpc, &miner2, 2, 0).await;
+    let best = best_hash(rpc);
+    // The node must sync to the new tip. If it wrongly bans a peer for
+    // sending stale filters, it will run out of peers and fail.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = async {
+                loop {
+                    if let Some(Event::FiltersSynced(update)) = channel.recv().await {
+                        if update.tip().hash == best {
+                            break;
+                        }
+                    }
+                }
+            } => {}
+            result = node_handle => {
+                let node_result = result.expect("node task panicked");
+                if let Err(e) = node_result {
+                    panic!("node died before syncing: {e}");
+                }
+            }
+        }
+    })
+    .await
+    .expect("node failed to sync — likely banned a peer for sending pre-reorg filters");
+    requester.shutdown().unwrap();
+    rpc.stop().unwrap();
+}
+
+// Two real bitcoind peers start synced. They disconnect and bitcoind1 reorgs.
+// The kyoto node first syncs filter headers from bitcoind1 (the correct, longer
+// chain). Then we add bitcoind2 (still on the old chain) as a peer. The node
+// must not ban bitcoind2 for serving stale data — it should handle the
+// disagreement gracefully.
+#[tokio::test]
+async fn reorg_during_filter_sync_two_peers() {
+    let (bitcoind, socket_addr) = start_bitcoind(true).unwrap();
+    let (bitcoind2, socket_addr2) = start_bitcoind(true).unwrap();
+    let rpc = &bitcoind.client;
+    let rpc2 = &bitcoind2.client;
+    let miner = rpc.new_address().unwrap();
+    // Mine enough blocks so that filter sync takes a while
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    mine_blocks(rpc, &miner, 2100, 0).await;
+    // Connect the two bitcoind instances and wait for them to sync
+    let addr2 = format!("{}:{}", socket_addr2.ip(), socket_addr2.port());
+    rpc.add_node(&addr2, corepc_node::AddNodeCommand::OneTry)
+        .unwrap();
+    loop {
+        if num_blocks(rpc2) >= num_blocks(rpc) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Disconnect so they can diverge
+    rpc.disconnect_node(&addr2).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Reorg bitcoind1: invalidate tip and mine a longer fork
+    let old_best = best_hash(rpc);
+    invalidate_block(rpc, &old_best).await;
+    let miner2 = rpc.new_address().unwrap();
+    mine_blocks(rpc, &miner2, 2, 0).await;
+    let best = best_hash(rpc);
+    // Start the kyoto node with ONLY the correct peer (bitcoind1)
+    let tempdir = tempfile::TempDir::new().unwrap().path().to_owned();
+    let host = (IpAddr::V4(*socket_addr.ip()), Some(socket_addr.port()));
+    let host2 = (IpAddr::V4(*socket_addr2.ip()), Some(socket_addr2.port()));
+    let builder = bip157::builder::Builder::new(bitcoin::Network::Regtest)
+        .chain_state(ChainState::Checkpoint(HeaderCheckpoint::from_genesis(
+            bitcoin::Network::Regtest,
+        )))
+        .add_peer(host)
+        .required_peers(1)
+        .data_dir(tempdir);
+    let (node, client) = builder.build();
+    let node_handle = tokio::task::spawn(async move { node.run().await });
+    let Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx: mut channel,
+    } = client;
+    tokio::task::spawn(async move { print_logs(info_rx, warn_rx).await });
+    // Wait until filter headers are flowing from the correct peer
+    loop {
+        if let Some(Event::IndexedFilter(_)) = channel.recv().await {
+            break;
+        }
+    }
+    // Now add the stale peer (bitcoind2, still on the old chain)
+    // requester.
+
+    requester.add_peer(host2).unwrap();
+    rpc.stop().unwrap();
+    // The node must sync to the correct tip without banning the stale peer
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = async {
+                loop {
+                    if let Some(Event::FiltersSynced(update)) = channel.recv().await {
+                        if update.tip().hash == best {
+                            break;
+                        }
+                    }
+                }
+            } => {}
+            result = node_handle => {
+                let node_result = result.expect("node task panicked");
+                if let Err(e) = node_result {
+                    panic!("node died before syncing: {e}");
+                }
+            }
+        }
+    })
+    .await
+    .expect("node failed to sync — likely banned the stale peer");
+    requester.shutdown().unwrap();
+    // rpc.stop().unwrap();
+    rpc2.stop().unwrap();
 }
 
 #[tokio::test]

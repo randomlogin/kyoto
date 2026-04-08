@@ -264,7 +264,9 @@ impl PeerMap {
 
     // This peer misbehaved in some way.
     pub async fn ban(&mut self, nonce: PeerId) {
+        println!("in ban");
         if let Some(peer) = self.map.get(&nonce) {
+            println!("banning the peer {:?}", peer);
             let mut db = self.db.lock().await;
             db.ban(&peer.record);
         }

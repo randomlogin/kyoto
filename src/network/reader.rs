@@ -16,6 +16,8 @@ use tokio::io::AsyncRead;
 use tokio::sync::mpsc::Sender;
 
 use crate::messages::RejectPayload;
+#[cfg(feature = "stats")]
+use crate::stats::PeerStatsHandle;
 
 use super::error::ReaderError;
 use super::inbound::MessageParser;
@@ -29,16 +31,32 @@ const MAX_HEADERS: usize = 2_000;
 pub(in crate::network) struct Reader<R: AsyncRead + Send + Sync + Unpin> {
     parser: MessageParser<R>,
     tx: Sender<ReaderMessage>,
+    #[cfg(feature = "stats")]
+    stats: PeerStatsHandle,
 }
 
 impl<R: AsyncRead + Send + Sync + Unpin> Reader<R> {
-    pub fn new(parser: MessageParser<R>, tx: Sender<ReaderMessage>) -> Self {
-        Self { parser, tx }
+    pub fn new(
+        parser: MessageParser<R>,
+        tx: Sender<ReaderMessage>,
+        #[cfg(feature = "stats")] stats: PeerStatsHandle,
+    ) -> Self {
+        Self {
+            parser,
+            tx,
+            #[cfg(feature = "stats")]
+            stats,
+        }
     }
 
     pub(in crate::network) async fn read_from_remote(&mut self) -> Result<(), ReaderError> {
         loop {
-            if let Some(message) = self.parser.read_message().await? {
+            let (message, _wire_bytes) = self.parser.read_message().await?;
+            // Decoys are traffic too, but not messages.
+            #[cfg(feature = "stats")]
+            self.stats
+                .record_received(_wire_bytes, message.is_some() as u64);
+            if let Some(message) = message {
                 let cleaned_message = self.parse_message(message);
                 match cleaned_message {
                     Some(message) => self.tx.send(message).await?,

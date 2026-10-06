@@ -272,7 +272,9 @@ impl PeerMap {
 
     // The address of a tracked peer, if it is still present in the map.
     pub fn addr_of(&self, nonce: PeerId) -> Option<AddrV2> {
-        self.map.get(&nonce).map(|peer| peer.record.network_addr().0)
+        self.map
+            .get(&nonce)
+            .map(|peer| peer.record.network_addr().0)
     }
 
     // Send a message to the specified peer
@@ -440,7 +442,8 @@ impl PeerMap {
             let mut db = self.db.lock().await;
             db.ban(&peer.record);
             drop(db);
-            self.dialog.send_warning(Warning::PeerBanned { addr, reason });
+            self.dialog
+                .send_warning(Warning::PeerBanned { addr, reason });
         }
     }
 

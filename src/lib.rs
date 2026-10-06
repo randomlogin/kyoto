@@ -65,6 +65,9 @@ pub mod stats;
 #[cfg(feature = "stats")]
 #[doc(inline)]
 pub use stats::{PeerStats, Stats, StatsSnapshot};
+// Loopback only: the endpoint has no authentication.
+#[cfg(feature = "stats")]
+const DEFAULT_STATS_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9332);
 
 use bitcoin::OutPoint;
 use chain::Filter;
@@ -395,6 +398,8 @@ struct Config {
     headers_only_sync: bool,
     magic: Option<bitcoin::p2p::Magic>,
     pow_target_spacing: Option<Duration>,
+    #[cfg(feature = "stats")]
+    stats_addr: SocketAddr,
 }
 
 impl Default for Config {
@@ -411,6 +416,8 @@ impl Default for Config {
             headers_only_sync: Default::default(),
             magic: None,
             pow_target_spacing: None,
+            #[cfg(feature = "stats")]
+            stats_addr: DEFAULT_STATS_ADDR,
         }
     }
 }

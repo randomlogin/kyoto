@@ -7,9 +7,15 @@
 //! endpoint exposes the same counters in Prometheus text-exposition format, so nothing here is
 //! throwaway: any Prometheus-compatible scraper can be pointed at it later without any changes.
 //!
-//! Run with `cargo run --example dashboard`, then open <http://127.0.0.1:3000>.
+//! It runs against Mutinynet, a custom signet with 30 second blocks, using a local Mutinynet node
+//! and the public seed as peers (see the constants below).
+//!
+//! Run with `cargo run --example dashboard --features stats`, then open <http://127.0.0.1:3000>.
+//! With the `stats` feature the node also serves its own statistics at
+//! <http://127.0.0.1:9332/metrics>.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,15 +29,23 @@ use axum::{
 use bip157::chain::{BlockHeaderChanges, ChainState};
 use bip157::messages::{Event, Warning};
 use bip157::{builder::Builder, chain::checkpoints::HashCheckpoint, Client, Info, Requester};
-use bip157::{Address, BlockHash, Network, Stats};
+use bip157::{Address, BlockHash, Magic, Network, ServiceFlags, Stats, TrustedPeer};
 use bitcoin::p2p::address::AddrV2;
 use prometheus::{GaugeVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+// Mutinynet is a custom signet: same genesis block, but its P2P magic comes from its own challenge
+// (the first four bytes of sha256d of the signet challenge, see BIP325).
 const NETWORK: Network = Network::Signet;
-const RECOVERY_HEIGHT: u32 = 201_000;
-const RECOVERY_HASH: &str = "0000002238d05b522875f9edc4c9f418dd89ccfde7e4c305e8448a87a5dc71b7";
+const MAGIC: [u8; 4] = [0xa5, 0xdf, 0x2d, 0xcb];
+// A local Mutinynet node, and the published public seed.
+const PEERS: [&str; 2] = ["127.0.0.1:38333", "45.79.52.207:38333"];
+// Blocks come every 30 seconds, so start near the tip instead of syncing from genesis. Replace
+// this with a recent block (see https://mutinynet.com) if it is too old: the public seed does not
+// answer header requests that span more than a few hundred blocks.
+const RECOVERY_HEIGHT: u32 = 3_484_440;
+const RECOVERY_HASH: &str = "0000024b162c3b8e95edc42ab5e734e4c89bc027c8b1135949da77b807290ddb";
 // The script(s) a real wallet or LN node would actually care about. Swap this out (or take a
 // list from configuration) for your own watched addresses/descriptors.
 const WATCHED_ADDR: &str = "tb1q9pvjqz5u5sdgpatg3wn0ce438u5cyv85lly0pc";
@@ -87,11 +101,8 @@ impl Metrics {
             "Unix timestamp this process started",
         )
         .unwrap();
-        let blocks_downloaded_total = IntCounter::new(
-            "kyoto_blocks_downloaded_total",
-            "Total blocks downloaded",
-        )
-        .unwrap();
+        let blocks_downloaded_total =
+            IntCounter::new("kyoto_blocks_downloaded_total", "Total blocks downloaded").unwrap();
         let filters_checked_total = IntCounter::new(
             "kyoto_filters_checked_total",
             "Total compact filters checked against the watched scripts",
@@ -119,9 +130,7 @@ impl Metrics {
         registry
             .register(Box::new(connected_peers.clone()))
             .unwrap();
-        registry
-            .register(Box::new(required_peers.clone()))
-            .unwrap();
+        registry.register(Box::new(required_peers.clone())).unwrap();
         registry.register(Box::new(tip_height.clone())).unwrap();
         registry
             .register(Box::new(start_time_seconds.clone()))
@@ -260,9 +269,18 @@ async fn main() {
     let mut watched = HashSet::new();
     watched.insert(watched_script);
 
+    // Both peers support the encrypted V2 transport.
+    let peers = PEERS.map(|addr| {
+        let mut peer = TrustedPeer::from(addr.parse::<SocketAddr>().unwrap());
+        peer.set_services(ServiceFlags::P2P_V2);
+        peer
+    });
     let builder = Builder::new(NETWORK);
     let (node, client) = builder
+        .custom_magic(Magic::from_bytes(MAGIC))
         .chain_state(ChainState::Checkpoint(checkpoint))
+        .add_peers(peers)
+        .whitelist_only()
         .required_peers(REQUIRED_PEERS)
         .build();
 
@@ -463,7 +481,10 @@ async fn run_snapshotter(state: Arc<AppState>) {
         let disconnects: u64 = state.disconnect_reasons.lock().unwrap().values().sum();
         let bans: u64 = state.ban_reasons.lock().unwrap().values().sum();
         let samples: [(&str, f64); 7] = [
-            ("connected_peers", state.metrics.connected_peers.get() as f64),
+            (
+                "connected_peers",
+                state.metrics.connected_peers.get() as f64,
+            ),
             ("tip_height", state.metrics.tip_height.get() as f64),
             (
                 "blocks_downloaded_total",
@@ -544,11 +565,28 @@ async fn stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         .duration_since(state.start_time)
         .unwrap_or_default()
         .as_secs();
-    let history: Vec<LogEntry> = state.history.lock().unwrap().iter().rev().cloned().collect();
-    let disconnect_reasons: Vec<(String, u64)> =
-        state.disconnect_reasons.lock().unwrap().clone().into_iter().collect();
-    let ban_reasons: Vec<(String, u64)> =
-        state.ban_reasons.lock().unwrap().clone().into_iter().collect();
+    let history: Vec<LogEntry> = state
+        .history
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    let disconnect_reasons: Vec<(String, u64)> = state
+        .disconnect_reasons
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+    let ban_reasons: Vec<(String, u64)> = state
+        .ban_reasons
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
     Json(StatsResponse {
         uptime_seconds,
         connected_peers: state.metrics.connected_peers.get(),
@@ -609,7 +647,9 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         &["addr"],
     )
     .unwrap();
-    peer_registry.register(Box::new(peer_uptime.clone())).unwrap();
+    peer_registry
+        .register(Box::new(peer_uptime.clone()))
+        .unwrap();
     for peer in peer_rows(&state.node_stats) {
         peer_uptime
             .with_label_values(&[&peer.addr])

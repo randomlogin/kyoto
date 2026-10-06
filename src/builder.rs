@@ -180,6 +180,18 @@ impl Builder {
         self
     }
 
+    /// Where the node serves its statistics in the Prometheus text format, at `/metrics`.
+    ///
+    /// With the `stats` feature the endpoint starts together with the node, on
+    /// `127.0.0.1:9332` unless this is set. It has no authentication, so bind it to a public
+    /// address only behind something that provides it. If the address cannot be bound the node
+    /// runs without the endpoint.
+    #[cfg(feature = "stats")]
+    pub fn stats_addr(mut self, addr: impl Into<std::net::SocketAddr>) -> Self {
+        self.config.stats_addr = addr.into();
+        self
+    }
+
     /// Consume the node builder and receive a [`Node`] and [`Client`].
     pub fn build(mut self) -> (Node, Client) {
         Node::new(self.network, core::mem::take(&mut self.config))

@@ -20,6 +20,8 @@ bip324 = { version = "0.11.0", default-features = false, features = [
     "tokio",
 ] }
 hashes = { package = "bitcoin_hashes", version = "0.20.0" }
+# Only used by the `stats` feature, to serve the metrics endpoint.
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1"], optional = true }
 tokio = { version = "1.19", default-features = false, features = [
     "rt-multi-thread",
     "sync",
@@ -30,8 +32,8 @@ tokio = { version = "1.19", default-features = false, features = [
 ] }
 
 [features]
-# Track bytes, P2P message counts, and per-peer uptime. See `bip157::Stats`.
-stats = []
+# Track network statistics and serve them for Prometheus at `/metrics`. See `bip157::Stats`.
+stats = ["dep:axum"]
 
 [[example]]
 name = "dashboard"

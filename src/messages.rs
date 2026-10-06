@@ -154,6 +154,8 @@ pub enum DisconnectReason {
     NoCompactFilterSupport,
     /// The connection was recycled after being held open for the configured maximum duration.
     MaxConnectionTimeExceeded,
+    /// An established connection ended: the peer hung up, or reading from it failed.
+    ConnectionClosed,
     /// The peer sent a peer-to-peer message that violated the expected protocol or sync state.
     ProtocolViolation(String),
 }
@@ -170,6 +172,7 @@ impl core::fmt::Display for DisconnectReason {
             DisconnectReason::MaxConnectionTimeExceeded => {
                 write!(f, "maximum connection time exceeded")
             }
+            DisconnectReason::ConnectionClosed => write!(f, "connection closed"),
             DisconnectReason::ProtocolViolation(reason) => write!(f, "{reason}"),
         }
     }

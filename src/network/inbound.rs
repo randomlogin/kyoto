@@ -17,17 +17,24 @@ pub(crate) enum MessageParser<R: AsyncRead + Send + Sync + Unpin> {
     V1(R, Magic),
 }
 
+// The bytes a V2 packet occupies on the wire besides its contents: the 3 length bytes, the header
+// byte, and the 16 byte authentication tag.
+const V2_PACKET_OVERHEAD: usize = 3 + 1 + 16;
+
 impl<R: AsyncRead + Send + Sync + Unpin> MessageParser<R> {
-    pub async fn read_message(&mut self) -> Result<Option<NetworkMessage>, ReaderError> {
+    // The next message, if there is one to act on (decoy packets have none), and how many bytes it
+    // took on the wire.
+    pub async fn read_message(&mut self) -> Result<(Option<NetworkMessage>, usize), ReaderError> {
         match self {
             MessageParser::V2(reader) => {
                 let payload = reader.read().await?;
+                let wire_bytes = payload.contents().len() + V2_PACKET_OVERHEAD;
                 match payload.packet_type() {
                     PacketType::Genuine => {
                         let parsed = p2p_v2::deserialize(payload.contents())?;
-                        Ok(Some(parsed))
+                        Ok((Some(parsed), wire_bytes))
                     }
-                    PacketType::Decoy => Ok(None),
+                    PacketType::Decoy => Ok((None, wire_bytes)),
                 }
             }
             MessageParser::V1(stream, magic) => {
@@ -45,8 +52,9 @@ impl<R: AsyncRead + Send + Sync + Unpin> MessageParser<R> {
                 let mut contents_buf = vec![0_u8; header.length as usize];
                 let _ = stream.read_exact(&mut contents_buf).await?;
                 message_buf.extend_from_slice(&contents_buf);
+                let wire_bytes = message_buf.len();
                 let message: RawNetworkMessage = deserialize(&message_buf)?;
-                Ok(Some(message.into_payload()))
+                Ok((Some(message.into_payload()), wire_bytes))
             }
         }
     }

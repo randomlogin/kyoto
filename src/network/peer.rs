@@ -19,6 +19,8 @@ use tokio::{
 
 use crate::network::gossip::TransactionCheck;
 use crate::network::RelayPolicy;
+#[cfg(feature = "stats")]
+use crate::stats::PeerStatsHandle;
 use crate::{
     broadcaster::{BroadcastQueue, TxIdentifier},
     messages::{DisconnectReason, Warning},
@@ -26,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    error::PeerError,
+    error::{PeerError, ReaderError},
     inbound::MessageParser,
     outbound::{MessageGenerator, Transport},
     reader::{Reader, ReaderMessage},
@@ -53,6 +55,9 @@ pub(crate) struct Peer {
     message_state: MessageState,
     tx_queue: Arc<Mutex<BroadcastQueue>>,
     relay_policy: RelayPolicy,
+    // Set once the connection is being tracked, in `run`.
+    #[cfg(feature = "stats")]
+    stats: Option<PeerStatsHandle>,
 }
 
 impl Peer {
@@ -83,6 +88,8 @@ impl Peer {
             timeout_config,
             message_state: MessageState::new(timeout_config.response_timeout),
             tx_queue,
+            #[cfg(feature = "stats")]
+            stats: None,
         }
     }
 
@@ -94,10 +101,14 @@ impl Peer {
         let start_time = Instant::now();
         // Tracked until this function returns, however it returns.
         #[cfg(feature = "stats")]
-        let _stats_guard = self
+        let stats_guard = self
             .dialog
             .stats
             .register_peer(self.nonce.0, self.source.network_addr().0);
+        #[cfg(feature = "stats")]
+        {
+            self.stats = Some(stats_guard.handle());
+        }
         let (tx, mut rx) = mpsc::channel(32);
         let reader_tx = tx.clone();
         let (reader, mut writer) = connection.into_split();
@@ -122,7 +133,12 @@ impl Peer {
                     transport: Transport::V2 { encryptor },
                     block_type: self.block_type,
                 };
-                let reader = Reader::new(MessageParser::V2(protocol_reader), tx);
+                let reader = Reader::new(
+                    MessageParser::V2(protocol_reader),
+                    tx,
+                    #[cfg(feature = "stats")]
+                    stats_guard.handle(),
+                );
                 (outbound_messages, reader)
             } else {
                 let outbound_messages = MessageGenerator {
@@ -130,7 +146,12 @@ impl Peer {
                     transport: Transport::V1,
                     block_type: self.block_type,
                 };
-                let reader = Reader::new(MessageParser::V1(reader, self.magic), tx);
+                let reader = Reader::new(
+                    MessageParser::V1(reader, self.magic),
+                    tx,
+                    #[cfg(feature = "stats")]
+                    stats_guard.handle(),
+                );
                 (outbound_messages, reader)
             };
 
@@ -149,6 +170,20 @@ impl Peer {
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             if read_handle.is_finished() {
+                // The reader ends when the peer hangs up, the socket fails, or a message cannot
+                // be read. Say which, otherwise the peer just vanishes.
+                let reason = match read_handle.await {
+                    Ok(Err(ReaderError::Io(_))) => Some(DisconnectReason::ConnectionClosed),
+                    // The node stopped listening to this peer, there is nobody to tell.
+                    Ok(Err(ReaderError::ChannelClosed)) | Ok(Ok(())) | Err(_) => None,
+                    Ok(Err(e)) => Some(DisconnectReason::ProtocolViolation(e.to_string())),
+                };
+                if let Some(reason) = reason {
+                    self.dialog.send_warning(Warning::PeerDisconnected {
+                        addr: self.source.network_addr().0,
+                        reason,
+                    });
+                }
                 return Ok(());
             }
             if let Some(nonce) = self.message_state.ping_state.send_ping() {
@@ -528,6 +563,10 @@ impl Peer {
         })
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        #[cfg(feature = "stats")]
+        if let Some(stats) = &self.stats {
+            stats.record_sent(message.len(), 1);
+        }
         Ok(())
     }
 

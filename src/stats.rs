@@ -10,6 +10,7 @@
 
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -17,7 +18,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
 use bitcoin::p2p::address::AddrV2;
+use tokio::{net::TcpListener, task::JoinHandle};
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -171,12 +174,178 @@ impl PeerStatsHandle {
     }
 }
 
+impl Stats {
+    /// The statistics in the Prometheus text exposition format.
+    pub fn render_prometheus(&self) -> String {
+        let snapshot = self.snapshot();
+        let mut out = String::new();
+        for (name, help, value) in [
+            (
+                "kyoto_bytes_received_total",
+                "Bytes read from peers.",
+                snapshot.bytes_received,
+            ),
+            (
+                "kyoto_bytes_sent_total",
+                "Bytes written to peers.",
+                snapshot.bytes_sent,
+            ),
+            (
+                "kyoto_messages_received_total",
+                "Peer-to-peer messages received.",
+                snapshot.messages_received,
+            ),
+            (
+                "kyoto_messages_sent_total",
+                "Peer-to-peer messages sent.",
+                snapshot.messages_sent,
+            ),
+        ] {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "# HELP kyoto_connected_peers Peers connected right now.\n\
+             # TYPE kyoto_connected_peers gauge\n\
+             kyoto_connected_peers {}\n",
+            snapshot.peers.len()
+        ));
+        out.push_str(
+            "# HELP kyoto_peer_uptime_seconds How long a connected peer has been connected.\n\
+             # TYPE kyoto_peer_uptime_seconds gauge\n",
+        );
+        for peer in &snapshot.peers {
+            out.push_str(&format!(
+                "kyoto_peer_uptime_seconds{{addr=\"{}\"}} {}\n",
+                escape_label(&addr_label(&peer.addr)),
+                peer.uptime.as_secs()
+            ));
+        }
+        out
+    }
+}
+
+fn addr_label(addr: &AddrV2) -> String {
+    match addr {
+        AddrV2::Ipv4(ip) => ip.to_string(),
+        AddrV2::Ipv6(ip) => ip.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+// Label values are quoted, so backslashes, quotes and newlines have to be escaped.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+async fn metrics(State(stats): State<Stats>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        stats.render_prometheus(),
+    )
+}
+
+fn router(stats: Stats) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(stats)
+}
+
+// Stops the server when dropped, so it lives exactly as long as the node does.
+pub(crate) struct ServerHandle(JoinHandle<()>);
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Serve `GET /metrics` on `addr` until the returned handle is dropped.
+///
+/// If the address cannot be bound the node carries on without the endpoint.
+pub(crate) fn spawn_server(addr: SocketAddr, stats: Stats) -> ServerHandle {
+    ServerHandle(tokio::spawn(async move {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                crate::debug!(format!("Serving statistics on http://{addr}/metrics"));
+                let _ = axum::serve(listener, router(stats)).await;
+            }
+            Err(e) => {
+                crate::debug!(format!(
+                    "Could not bind the statistics endpoint to {addr}: {e}"
+                ));
+            }
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn addr(last: u8) -> AddrV2 {
         AddrV2::Ipv4(std::net::Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn serves_prometheus_metrics() {
+        let stats = Stats::default();
+        let peer = stats.register_peer(1, addr(7));
+        peer.handle().record_received(1234, 3);
+        peer.handle().record_sent(56, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router(stats)).await;
+        });
+
+        let response = http_get(bound, "/metrics").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("text/plain; version=0.0.4"), "{response}");
+        assert!(
+            response.contains("kyoto_bytes_received_total 1234\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("kyoto_bytes_sent_total 56\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("kyoto_messages_received_total 3\n"),
+            "{response}"
+        );
+        assert!(
+            response.contains("kyoto_messages_sent_total 2\n"),
+            "{response}"
+        );
+        assert!(response.contains("kyoto_connected_peers 1\n"), "{response}");
+        assert!(
+            response.contains("kyoto_peer_uptime_seconds{addr=\"10.0.0.7\"} "),
+            "{response}"
+        );
+
+        let missing = http_get(bound, "/other").await;
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+        server.abort();
+    }
+
+    #[test]
+    fn labels_are_escaped() {
+        assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
     #[test]

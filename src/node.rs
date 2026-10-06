@@ -61,6 +61,8 @@ pub struct Node {
     client_recv: UnboundedReceiver<ClientMessage>,
     peer_recv: Receiver<PeerThreadMessage>,
     headers_only_sync: bool,
+    #[cfg(feature = "stats")]
+    stats_addr: std::net::SocketAddr,
 }
 
 impl Node {
@@ -77,6 +79,8 @@ impl Node {
             headers_only_sync,
             magic,
             pow_target_spacing,
+            #[cfg(feature = "stats")]
+            stats_addr,
         } = config;
         let magic: Magic = magic.unwrap_or_else(|| network.magic());
         // Set up a communication channel between the node and client
@@ -131,6 +135,8 @@ impl Node {
                 client_recv: crx,
                 peer_recv: mrx,
                 headers_only_sync,
+                #[cfg(feature = "stats")]
+                stats_addr,
             },
             client,
         )
@@ -147,6 +153,9 @@ impl Node {
             "Configured connection requirement: {} peers",
             self.required_peers
         ));
+        // Serves the statistics for as long as the node runs.
+        #[cfg(feature = "stats")]
+        let _stats_server = crate::stats::spawn_server(self.stats_addr, self.dialog.stats.clone());
         let mut last_block = LastBlockMonitor::new();
         last_block.reset();
         let mut interval = tokio::time::interval(LOOP_TIMEOUT);

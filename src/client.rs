@@ -35,9 +35,14 @@ impl Client {
         warn_rx: mpsc::Receiver<Warning>,
         event_rx: mpsc::UnboundedReceiver<Event>,
         ntx: UnboundedSender<ClientMessage>,
+        #[cfg(feature = "stats")] stats: crate::Stats,
     ) -> Self {
         Self {
-            requester: Requester::new(ntx),
+            requester: Requester::new(
+                ntx,
+                #[cfg(feature = "stats")]
+                stats,
+            ),
             info_rx,
             warn_rx,
             event_rx,
@@ -49,11 +54,29 @@ impl Client {
 #[derive(Debug, Clone)]
 pub struct Requester {
     ntx: UnboundedSender<ClientMessage>,
+    #[cfg(feature = "stats")]
+    stats: crate::Stats,
 }
 
 impl Requester {
-    fn new(ntx: UnboundedSender<ClientMessage>) -> Self {
-        Self { ntx }
+    fn new(
+        ntx: UnboundedSender<ClientMessage>,
+        #[cfg(feature = "stats")] stats: crate::Stats,
+    ) -> Self {
+        Self {
+            ntx,
+            #[cfg(feature = "stats")]
+            stats,
+        }
+    }
+
+    /// A handle to the node's network statistics: bytes and messages sent and received, and
+    /// the connected peers with their uptime. Clone it and read it from anywhere, at any time.
+    ///
+    /// Requires the `stats` feature.
+    #[cfg(feature = "stats")]
+    pub fn stats(&self) -> crate::Stats {
+        self.stats.clone()
     }
 
     /// Tell the node to shut down.

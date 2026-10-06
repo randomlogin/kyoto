@@ -23,6 +23,7 @@ use tokio::{
 use crate::{
     broadcaster::BroadcastQueue,
     default_port_from_network,
+    messages::DisconnectReason,
     network::{
         dns::{bootstrap_dns, resolve_hostname_socks5},
         error::PeerError,
@@ -30,7 +31,7 @@ use crate::{
         peer::Peer,
         PeerId, PeerTimeoutConfig, RelayPolicy,
     },
-    BlockType, Dialog, TrustedPeer, TrustedPeerInner,
+    BlockType, Dialog, TrustedPeer, TrustedPeerInner, Warning,
 };
 
 use super::{AddressBook, ConnectionType, MainThreadMessage, PeerThreadMessage};
@@ -269,6 +270,11 @@ impl PeerMap {
             .collect()
     }
 
+    // The address of a tracked peer, if it is still present in the map.
+    pub fn addr_of(&self, nonce: PeerId) -> Option<AddrV2> {
+        self.map.get(&nonce).map(|peer| peer.record.network_addr().0)
+    }
+
     // Send a message to the specified peer
     pub fn send_message(&self, nonce: PeerId, message: MainThreadMessage) {
         if let Some(peer) = self.map.get(&nonce) {
@@ -428,10 +434,13 @@ impl PeerMap {
     }
 
     // This peer misbehaved in some way.
-    pub async fn ban(&mut self, nonce: PeerId) {
+    pub async fn ban(&mut self, nonce: PeerId, reason: DisconnectReason) {
         if let Some(peer) = self.map.get(&nonce) {
+            let addr = peer.record.network_addr().0;
             let mut db = self.db.lock().await;
             db.ban(&peer.record);
+            drop(db);
+            self.dialog.send_warning(Warning::PeerBanned { addr, reason });
         }
     }
 

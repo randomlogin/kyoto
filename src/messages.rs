@@ -141,6 +141,40 @@ impl<D: Clone, U> ClientRequest<D, U> {
     }
 }
 
+/// The reason a peer was disconnected or banned.
+#[derive(Debug, Clone)]
+pub enum DisconnectReason {
+    /// The peer stopped responding, or responded too slowly, to a request.
+    Timeout,
+    /// A TCP connection or handshake to the peer could not be established.
+    ConnectFailed,
+    /// The peer's advertised protocol version is not supported.
+    OutdatedVersion,
+    /// The peer does not signal for compact block filter support.
+    NoCompactFilterSupport,
+    /// The connection was recycled after being held open for the configured maximum duration.
+    MaxConnectionTimeExceeded,
+    /// The peer sent a peer-to-peer message that violated the expected protocol or sync state.
+    ProtocolViolation(String),
+}
+
+impl core::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DisconnectReason::Timeout => write!(f, "timed out"),
+            DisconnectReason::ConnectFailed => write!(f, "connection failed"),
+            DisconnectReason::OutdatedVersion => write!(f, "outdated protocol version"),
+            DisconnectReason::NoCompactFilterSupport => {
+                write!(f, "does not support compact block filters")
+            }
+            DisconnectReason::MaxConnectionTimeExceeded => {
+                write!(f, "maximum connection time exceeded")
+            }
+            DisconnectReason::ProtocolViolation(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
 /// Warnings a node may issue while running.
 #[derive(Debug, Clone)]
 pub enum Warning {
@@ -151,12 +185,20 @@ pub enum Warning {
         /// The configured requirement.
         required: usize,
     },
-    /// A connection to a peer timed out.
-    PeerTimedOut,
-    /// The node was unable to connect to a peer in the database.
-    CouldNotConnect,
-    /// A connection was maintained, but the peer does not signal for compact block filers.
-    NoCompactFilters,
+    /// A peer was disconnected, but not banned.
+    PeerDisconnected {
+        /// The address of the peer that was disconnected.
+        addr: AddrV2,
+        /// Why the peer was disconnected.
+        reason: DisconnectReason,
+    },
+    /// A peer misbehaved and was banned, removing it from the address database.
+    PeerBanned {
+        /// The address of the peer that was banned.
+        addr: AddrV2,
+        /// Why the peer was banned.
+        reason: DisconnectReason,
+    },
     /// The node has been waiting for new `inv` and will find new peers to avoid block withholding.
     PotentialStaleTip,
     /// A peer sent us a peer-to-peer message the node did not request.
@@ -168,11 +210,6 @@ pub enum Warning {
     },
     /// The peer sent us a potential fork.
     EvaluatingFork,
-    /// An unexpected error occurred processing a peer-to-peer message.
-    UnexpectedSyncError {
-        /// Additional context as to why block syncing failed.
-        warning: String,
-    },
     /// A channel that was supposed to receive a message was dropped.
     ChannelDropped,
 }
@@ -189,12 +226,6 @@ impl core::fmt::Display for Warning {
                     "Looking for connections to peers. Connected: {connected}, Required: {required}"
                 )
             }
-            Warning::CouldNotConnect => {
-                write!(f, "An attempted connection failed or timed out.")
-            }
-            Warning::NoCompactFilters => {
-                write!(f, "A connected peer does not serve compact block filters.")
-            }
             Warning::PotentialStaleTip => {
                 write!(
                     f,
@@ -205,11 +236,11 @@ impl core::fmt::Display for Warning {
                 write!(f, "A transaction got rejected: WTXID {}", payload.wtxid)
             }
             Warning::EvaluatingFork => write!(f, "Peer sent us a potential fork."),
-            Warning::UnexpectedSyncError { warning } => {
-                write!(f, "Error handling a P2P message: {warning}")
+            Warning::PeerDisconnected { addr, reason } => {
+                write!(f, "Disconnected from peer {addr:?}: {reason}")
             }
-            Warning::PeerTimedOut => {
-                write!(f, "A connection to a peer timed out.")
+            Warning::PeerBanned { addr, reason } => {
+                write!(f, "Banned peer {addr:?}: {reason}")
             }
             Warning::UnsolicitedMessage => {
                 write!(

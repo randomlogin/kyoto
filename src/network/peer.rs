@@ -21,7 +21,7 @@ use crate::network::gossip::TransactionCheck;
 use crate::network::RelayPolicy;
 use crate::{
     broadcaster::{BroadcastQueue, TxIdentifier},
-    messages::Warning,
+    messages::{DisconnectReason, Warning},
     BlockType, Dialog, Info,
 };
 
@@ -92,6 +92,12 @@ impl Peer {
         is_proxy_connection: bool,
     ) -> Result<(), PeerError> {
         let start_time = Instant::now();
+        // Tracked until this function returns, however it returns.
+        #[cfg(feature = "stats")]
+        let _stats_guard = self
+            .dialog
+            .stats
+            .register_peer(self.nonce.0, self.source.network_addr().0);
         let (tx, mut rx) = mpsc::channel(32);
         let reader_tx = tx.clone();
         let (reader, mut writer) = connection.into_split();
@@ -104,7 +110,10 @@ impl Peer {
                         .await
                         .map_err(|_| PeerError::HandshakeFailed)?;
                 if handshake_result.is_err() {
-                    self.dialog.send_warning(Warning::CouldNotConnect);
+                    self.dialog.send_warning(Warning::PeerDisconnected {
+                        addr: self.source.network_addr().0,
+                        reason: DisconnectReason::ConnectFailed,
+                    });
                 }
                 let (protocol_reader, encryptor, w) = handshake_result?;
                 writer = w;
@@ -151,11 +160,17 @@ impl Peer {
                     .insert(msg_id, Instant::now());
             }
             if self.message_state.unresponsive() {
-                self.dialog.send_warning(Warning::PeerTimedOut);
+                self.dialog.send_warning(Warning::PeerDisconnected {
+                    addr: self.source.network_addr().0,
+                    reason: DisconnectReason::Timeout,
+                });
                 return Ok(());
             }
             if self.message_state.filter_rate.slow_peer() {
-                self.dialog.send_warning(Warning::PeerTimedOut);
+                self.dialog.send_warning(Warning::PeerDisconnected {
+                    addr: self.source.network_addr().0,
+                    reason: DisconnectReason::Timeout,
+                });
                 return Ok(());
             }
             if Instant::now().duration_since(start_time) > self.timeout_config.max_connection_time {
@@ -163,6 +178,10 @@ impl Peer {
                     "The connection to peer {} has been maintained for over {} seconds, finding a new peer",
                     self.nonce, self.timeout_config.max_connection_time.as_secs(),
                 ));
+                self.dialog.send_warning(Warning::PeerDisconnected {
+                    addr: self.source.network_addr().0,
+                    reason: DisconnectReason::MaxConnectionTimeExceeded,
+                });
                 return Ok(());
             }
             select! {

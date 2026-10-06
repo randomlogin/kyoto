@@ -40,7 +40,7 @@ use crate::{
 use super::{
     client::Client,
     error::NodeError,
-    messages::{ClientMessage, Event, Info, SyncUpdate, Warning},
+    messages::{ClientMessage, DisconnectReason, Event, Info, SyncUpdate, Warning},
     Dialog,
 };
 
@@ -84,9 +84,16 @@ impl Node {
         let (warn_tx, warn_rx) = mpsc::channel::<Warning>(512);
         let (event_tx, event_rx) = mpsc::unbounded_channel::<Event>();
         let (ctx, crx) = mpsc::unbounded_channel::<ClientMessage>();
-        let client = Client::new(info_rx, warn_rx, event_rx, ctx);
         // A structured way to talk to the client
         let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
+        let client = Client::new(
+            info_rx,
+            warn_rx,
+            event_rx,
+            ctx,
+            #[cfg(feature = "stats")]
+            dialog.stats.clone(),
+        );
         // We always assume we are behind
         let state = NodeState::Behind;
         // Configure the peer manager
@@ -326,8 +333,12 @@ impl Node {
             });
             match self.peer_map.next_peer().await {
                 Some(address) => {
+                    let addr = address.network_addr().0;
                     if self.peer_map.dispatch(address).await.is_err() {
-                        self.dialog.send_warning(Warning::CouldNotConnect);
+                        self.dialog.send_warning(Warning::PeerDisconnected {
+                            addr,
+                            reason: DisconnectReason::ConnectFailed,
+                        });
                     }
                 }
                 // Without DNS seeding the address book is empty until the first peer gossips.
@@ -337,8 +348,12 @@ impl Node {
         }
         if self.peer_map.needs_gossip_listener() {
             if let Some(peer) = self.peer_map.next_peer().await {
+                let addr = peer.network_addr().0;
                 if self.peer_map.dispatch_gossip(peer).await.is_err() {
-                    self.dialog.send_warning(Warning::CouldNotConnect);
+                    self.dialog.send_warning(Warning::PeerDisconnected {
+                        addr,
+                        reason: DisconnectReason::ConnectFailed,
+                    });
                 }
             }
         }
@@ -449,6 +464,12 @@ impl Node {
         version_message: VersionMessage,
     ) -> Result<MainThreadMessage, NodeError> {
         if version_message.version < WTXID_VERSION {
+            if let Some(addr) = self.peer_map.addr_of(nonce) {
+                self.dialog.send_warning(Warning::PeerDisconnected {
+                    addr,
+                    reason: DisconnectReason::OutdatedVersion,
+                });
+            }
             return Ok(MainThreadMessage::Disconnect);
         }
         match self.state {
@@ -457,7 +478,12 @@ impl Node {
                 if !version_message.services.has(ServiceFlags::COMPACT_FILTERS)
                     || !version_message.services.has(ServiceFlags::NETWORK)
                 {
-                    self.dialog.send_warning(Warning::NoCompactFilters);
+                    if let Some(addr) = self.peer_map.addr_of(nonce) {
+                        self.dialog.send_warning(Warning::PeerDisconnected {
+                            addr,
+                            reason: DisconnectReason::NoCompactFilterSupport,
+                        });
+                    }
                     return Ok(MainThreadMessage::Disconnect);
                 }
             }
@@ -522,10 +548,14 @@ impl Node {
                 }
             },
             Err(e) => {
-                self.dialog.send_warning(Warning::UnexpectedSyncError {
-                    warning: format!("Unexpected header syncing error: {e}"),
-                });
-                self.peer_map.ban(peer_id).await;
+                self.peer_map
+                    .ban(
+                        peer_id,
+                        DisconnectReason::ProtocolViolation(format!(
+                            "Unexpected header syncing error: {e}"
+                        )),
+                    )
+                    .await;
                 return Some(MainThreadMessage::Disconnect);
             }
         }
@@ -543,17 +573,26 @@ impl Node {
                 CFHeaderChanges::AddedToQueue => None,
                 CFHeaderChanges::Extended => self.next_stateful_message(),
                 CFHeaderChanges::Conflict => {
-                    self.dialog.send_warning(Warning::UnexpectedSyncError {
-                        warning: "Found a conflict while peers are sending filter headers".into(),
-                    });
+                    if let Some(addr) = self.peer_map.addr_of(peer_id) {
+                        self.dialog.send_warning(Warning::PeerDisconnected {
+                            addr,
+                            reason: DisconnectReason::ProtocolViolation(
+                                "Found a conflict while peers are sending filter headers".into(),
+                            ),
+                        });
+                    }
                     Some(MainThreadMessage::Disconnect)
                 }
             },
             Err(e) => {
-                self.dialog.send_warning(Warning::UnexpectedSyncError {
-                    warning: format!("Compact filter header syncing encountered an error: {e}"),
-                });
-                self.peer_map.ban(peer_id).await;
+                self.peer_map
+                    .ban(
+                        peer_id,
+                        DisconnectReason::ProtocolViolation(format!(
+                            "Compact filter header syncing encountered an error: {e}"
+                        )),
+                    )
+                    .await;
                 self.peer_map
                     .send_message(peer_id, MainThreadMessage::Disconnect);
                 None
@@ -577,10 +616,14 @@ impl Node {
                 None
             }
             Err(e) => {
-                self.dialog.send_warning(Warning::UnexpectedSyncError {
-                    warning: format!("Compact filter syncing encountered an error: {e}"),
-                });
-                self.peer_map.ban(peer_id).await;
+                self.peer_map
+                    .ban(
+                        peer_id,
+                        DisconnectReason::ProtocolViolation(format!(
+                            "Compact filter syncing encountered an error: {e}"
+                        )),
+                    )
+                    .await;
                 Some(MainThreadMessage::Disconnect)
             }
         }
@@ -592,18 +635,26 @@ impl Node {
         let height = match self.chain.header_chain.height_of_hash(block_hash) {
             Some(height) => height,
             None => {
-                self.dialog.send_warning(Warning::UnexpectedSyncError {
-                    warning: "A block received does not have a known hash".into(),
-                });
-                self.peer_map.ban(peer_id).await;
+                self.peer_map
+                    .ban(
+                        peer_id,
+                        DisconnectReason::ProtocolViolation(
+                            "A block received does not have a known hash".into(),
+                        ),
+                    )
+                    .await;
                 return Some(MainThreadMessage::Disconnect);
             }
         };
         if !block.check_merkle_root() {
-            self.dialog.send_warning(Warning::UnexpectedSyncError {
-                warning: "A block received does not have a valid merkle root".into(),
-            });
-            self.peer_map.ban(peer_id).await;
+            self.peer_map
+                .ban(
+                    peer_id,
+                    DisconnectReason::ProtocolViolation(
+                        "A block received does not have a valid merkle root".into(),
+                    ),
+                )
+                .await;
             return Some(MainThreadMessage::Disconnect);
         }
         let process_block_response = self.block_queue.process_block(&block_hash);

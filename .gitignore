@@ -7,3 +7,4 @@ Cargo.lock
 .idea/
 /.vscode
 src/.DS_Store
+dashboard.sqlite*

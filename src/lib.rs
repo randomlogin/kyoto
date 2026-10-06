@@ -59,6 +59,12 @@ pub mod error;
 pub mod messages;
 /// The structure that communicates with the Bitcoin P2P network and collects data.
 pub mod node;
+/// Network statistics: bytes, messages, and per-peer uptime.
+#[cfg(feature = "stats")]
+pub mod stats;
+#[cfg(feature = "stats")]
+#[doc(inline)]
+pub use stats::{PeerStats, Stats, StatsSnapshot};
 
 use bitcoin::OutPoint;
 use chain::Filter;
@@ -87,7 +93,7 @@ pub use {
     crate::chain::ChainState,
     crate::client::{Client, Requester},
     crate::error::{ClientError, NodeError},
-    crate::messages::{Event, Info, RejectPayload, SyncUpdate, Warning},
+    crate::messages::{DisconnectReason, Event, Info, RejectPayload, SyncUpdate, Warning},
     crate::node::Node,
 };
 
@@ -445,6 +451,8 @@ struct Dialog {
     info_tx: Sender<Info>,
     warn_tx: Sender<Warning>,
     event_tx: UnboundedSender<Event>,
+    #[cfg(feature = "stats")]
+    stats: Stats,
 }
 
 impl Dialog {
@@ -457,6 +465,8 @@ impl Dialog {
             info_tx,
             warn_tx,
             event_tx,
+            #[cfg(feature = "stats")]
+            stats: Stats::default(),
         }
     }
 

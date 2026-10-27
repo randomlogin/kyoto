@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::HashCheckpoint;
 
@@ -92,7 +92,10 @@ impl BlockNode {
 
 #[derive(Debug)]
 pub struct BlockTree {
-    canonical_hashes: BTreeMap<Height, BlockHash>,
+    // The hashes of the canonical chain, indexed by height. The block the tree started from is not
+    // stored, the first entry is the block after it, at `first_height`.
+    canonical_hashes: Vec<BlockHash>,
+    first_height: Height,
     headers: HashMap<BlockHash, BlockNode>,
     active_tip: Tip,
     candidate_forks: Vec<Tip>,
@@ -104,7 +107,8 @@ impl BlockTree {
     pub(crate) fn new(tip: impl Into<Tip>, network: Network) -> Self {
         let tip = tip.into();
         Self {
-            canonical_hashes: BTreeMap::new(),
+            canonical_hashes: Vec::new(),
+            first_height: tip.height.increment(),
             headers: HashMap::with_capacity(20_000),
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
@@ -123,7 +127,8 @@ impl BlockTree {
         };
         let headers = HashMap::with_capacity(20_000);
         Self {
-            canonical_hashes: BTreeMap::new(),
+            canonical_hashes: Vec::new(),
+            first_height: height.increment(),
             headers,
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
@@ -168,7 +173,7 @@ impl BlockTree {
             let new_block_node = BlockNode::new(new_height, new_header, new_work);
             self.headers.insert(new_hash, new_block_node);
             self.active_tip = new_tip;
-            self.canonical_hashes.insert(new_height, new_hash);
+            self.canonical_hashes.push(new_hash);
             return AcceptHeaderChanges::Accepted {
                 connected_at: IndexedHeader::new(new_height, new_header),
             };
@@ -275,47 +280,33 @@ impl BlockTree {
     }
 
     fn switch_to_fork(&mut self, new_best: &Tip) -> (Vec<IndexedHeader>, Vec<IndexedHeader>) {
-        let mut curr_hash = new_best.hash;
+        // Walk back from the new best block to the first block that is canonical already.
         let mut connections = Vec::new();
-        let mut disconnections = Vec::new();
-        while let Some((&height, &hash)) = self.canonical_hashes.last_key_value() {
-            if height <= new_best.height {
+        let mut new_hashes = Vec::new();
+        let mut curr_hash = new_best.hash;
+        while let Some(node) = self.headers.get(&curr_hash) {
+            let index = (node.height - self.first_height) as usize;
+            if self.canonical_hashes.get(index) == Some(&curr_hash) {
                 break;
             }
-            self.canonical_hashes.remove(&height);
-            if let Some(node) = self.headers.get(&hash) {
-                disconnections.push(IndexedHeader::new(node.height, node.header));
-            }
+            connections.push(IndexedHeader::new(node.height, node.header));
+            new_hashes.push(curr_hash);
+            curr_hash = node.header.prev_blockhash;
         }
-        loop {
-            match self.headers.get(&curr_hash) {
-                Some(node) => {
-                    let next = node.header.prev_blockhash;
-                    match self.canonical_hashes.get_mut(&node.height) {
-                        Some(canonical_hash) => {
-                            let reorged_hash = *canonical_hash;
-                            if reorged_hash.ne(&curr_hash) {
-                                if let Some(reorged) = self.headers.get(&reorged_hash) {
-                                    disconnections
-                                        .push(IndexedHeader::new(reorged.height, reorged.header));
-                                }
-                                *canonical_hash = curr_hash;
-                                connections.push(IndexedHeader::new(node.height, node.header));
-                                curr_hash = next;
-                            } else {
-                                return (connections, disconnections);
-                            }
-                        }
-                        None => {
-                            self.canonical_hashes.insert(node.height, curr_hash);
-                            connections.push(IndexedHeader::new(node.height, node.header));
-                            curr_hash = next;
-                        }
-                    }
-                }
-                None => return (connections, disconnections),
-            }
-        }
+        // Everything canonical above that block is disconnected, highest first.
+        let keep = connections
+            .last()
+            .map_or(new_best.height + 1, |lowest| lowest.height)
+            - self.first_height;
+        let disconnections = self
+            .canonical_hashes
+            .drain(keep as usize..)
+            .rev()
+            .filter_map(|hash| self.headers.get(&hash))
+            .map(|node| IndexedHeader::new(node.height, node.header))
+            .collect();
+        self.canonical_hashes.extend(new_hashes.into_iter().rev());
+        (connections, disconnections)
     }
 
     fn compute_next_work_required(&self, parent: BlockHash) -> Option<CompactTarget> {
@@ -347,12 +338,13 @@ impl BlockTree {
         if self.active_tip.height.eq(&height) {
             return Some(self.active_tip.hash);
         }
-        self.canonical_hashes.get(&height).copied()
+        let index = height.checked_sub(self.first_height)?;
+        self.canonical_hashes.get(index as usize).copied()
     }
 
     pub(crate) fn header_at_height(&self, height: Height) -> Option<Header> {
-        let hash = self.canonical_hashes.get(&height)?;
-        self.headers.get(hash).map(|node| node.header)
+        let hash = self.block_hash_at_height(height)?;
+        self.headers.get(&hash).map(|node| node.header)
     }
 
     // Returns the height of `hash` only when it sits on the canonical chain of most work.
@@ -397,9 +389,8 @@ impl BlockTree {
     }
 
     pub(crate) fn filter_hash_at_height(&self, height: impl Into<Height>) -> Option<FilterHash> {
-        let height = height.into();
-        let hash = self.canonical_hashes.get(&height)?;
-        Some(self.headers.get(hash)?.filter_commitment?.filter_hash)
+        let hash = self.block_hash_at_height(height.into())?;
+        Some(self.headers.get(&hash)?.filter_commitment?.filter_hash)
     }
 
     pub(crate) fn set_commitment(&mut self, commitment: FilterCommitment, hash: BlockHash) {
@@ -469,13 +460,13 @@ impl BlockTree {
         self.ancestors(self.active_tip.hash)
     }
 
-    // The lowest height of the canonical chain above genesis, or the tip if there is none.
+    // The height of the first block stored in the tree, or the tip if there is none.
     pub(crate) fn lowest_stored_block_height(&self) -> Height {
-        self.canonical_hashes
-            .range(1..)
-            .next()
-            .map(|(&height, _)| height)
-            .unwrap_or(self.active_tip.height)
+        if self.canonical_hashes.is_empty() {
+            self.active_tip.height
+        } else {
+            self.first_height
+        }
     }
 
     //For contiguous properties (being known, filter checked, etc.) we use binary search to find
@@ -484,28 +475,11 @@ impl BlockTree {
         &self,
         pred: impl Fn(&BlockNode) -> bool,
     ) -> Option<&BlockNode> {
-        let mut low = self
+        let synced = self
             .canonical_hashes
-            .range(1..)
-            .next()
-            .map(|(&height, _)| height)?;
-        let mut high = self.active_tip.height;
-        let mut found = None;
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            match self
-                .canonical_hashes
-                .get(&mid)
-                .and_then(|hash| self.headers.get(hash))
-            {
-                Some(node) if pred(node) => {
-                    found = Some(node);
-                    low = mid + 1;
-                }
-                _ => high = mid - 1,
-            }
-        }
-        found
+            .partition_point(|hash| self.headers.get(hash).is_some_and(&pred));
+        let last_synced = self.canonical_hashes.get(synced.checked_sub(1)?)?;
+        self.headers.get(last_synced)
     }
 
     fn ancestors(&self, hash: BlockHash) -> BlockNodeIterator<'_> {
@@ -739,7 +713,7 @@ mod tests {
         tree.headers
             .insert(header.block_hash(), BlockNode::new(height, header, work));
         if canonical {
-            tree.canonical_hashes.insert(height, header.block_hash());
+            tree.canonical_hashes.push(header.block_hash());
         }
         work
     }
@@ -940,5 +914,121 @@ mod tests {
         let child = mine_child(genesis, 600, genesis.bits);
         short.accept_header(child);
         assert_eq!(short.locators().first(), Some(&child.block_hash()));
+    }
+
+    // Counts the live and peak heap bytes of the test binary.
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+        pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+        struct Counting;
+
+        fn grow(bytes: usize) {
+            let live = LIVE.fetch_add(bytes, Relaxed) + bytes;
+            PEAK.fetch_max(live, Relaxed);
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = System.alloc(layout);
+                if !ptr.is_null() {
+                    grow(layout.size());
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout);
+                LIVE.fetch_sub(layout.size(), Relaxed);
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let new_ptr = System.realloc(ptr, layout, new_size);
+                if !new_ptr.is_null() {
+                    LIVE.fetch_sub(layout.size(), Relaxed);
+                    grow(new_size);
+                }
+                new_ptr
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+    }
+
+    // Run it alone, in release:
+    // `cargo test --release --lib memory_footprint -- --ignored --nocapture`
+    #[test]
+    #[ignore = "memory benchmark"]
+    fn memory_footprint() {
+        use counting::{LIVE, PEAK};
+        use std::collections::BTreeMap;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        const COUNT: u32 = 1_000_000;
+        let live = || LIVE.load(Relaxed);
+        let mb = |bytes: usize| bytes as f64 / 1_048_576.0;
+
+        // A whole tree of regtest headers, which only differ in their nonce.
+        let before = live();
+        PEAK.store(before, Relaxed);
+        let mut tree = BlockTree::from_genesis(Network::Regtest);
+        let mut header = genesis_block(Network::Regtest).header;
+        for nonce in 1..=COUNT {
+            header.prev_blockhash = tree.tip_hash();
+            header.nonce = nonce;
+            assert!(matches!(
+                tree.accept_header(header),
+                AcceptHeaderChanges::Accepted { .. }
+            ));
+        }
+        let tree_bytes = live() - before;
+        let tree_peak = PEAK.load(Relaxed) - before;
+        println!(
+            "size of a BlockNode: {} bytes",
+            std::mem::size_of::<BlockNode>()
+        );
+        println!(
+            "headers map: {} slots for {COUNT} headers",
+            tree.headers.capacity()
+        );
+        println!(
+            "whole tree: {:.1} MB live ({} bytes per header), {:.1} MB peak while building",
+            mb(tree_bytes),
+            tree_bytes / COUNT as usize,
+            mb(tree_peak),
+        );
+        drop(tree);
+
+        // Only the canonical hashes, built the way the tree builds them: in order, one per height.
+        let hash = genesis_block(Network::Regtest).block_hash();
+        let before = live();
+        let mut map = BTreeMap::new();
+        for height in 1..=COUNT {
+            map.insert(height, hash);
+        }
+        let map_bytes = live() - before;
+        println!(
+            "BTreeMap<u32, BlockHash>: {:.1} MB ({} bytes per entry)",
+            mb(map_bytes),
+            map_bytes / COUNT as usize,
+        );
+        drop(map);
+
+        let before = live();
+        let mut vec = Vec::new();
+        for _ in 1..=COUNT {
+            vec.push(hash);
+        }
+        let vec_bytes = live() - before;
+        println!(
+            "Vec<BlockHash>: {:.1} MB ({} bytes per entry, capacity {})",
+            mb(vec_bytes),
+            vec_bytes / COUNT as usize,
+            vec.capacity(),
+        );
     }
 }

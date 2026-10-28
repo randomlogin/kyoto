@@ -90,13 +90,59 @@ impl BlockNode {
     }
 }
 
+// All the blocks the tree has seen, including those on stale forks. The nodes are stored in the
+// order they arrived and the map only holds the position of a node. A map of whole nodes keeps
+// its table about half empty, and a node is much larger than its position.
+#[derive(Debug)]
+struct NodeStore {
+    nodes: Vec<BlockNode>,
+    positions: HashMap<BlockHash, u32>,
+}
+
+impl NodeStore {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            nodes: Vec::with_capacity(capacity),
+            positions: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn get(&self, hash: &BlockHash) -> Option<&BlockNode> {
+        let position = *self.positions.get(hash)?;
+        self.nodes.get(position as usize)
+    }
+
+    fn get_mut(&mut self, hash: &BlockHash) -> Option<&mut BlockNode> {
+        let position = *self.positions.get(hash)?;
+        self.nodes.get_mut(position as usize)
+    }
+
+    fn contains_key(&self, hash: &BlockHash) -> bool {
+        self.positions.contains_key(hash)
+    }
+
+    fn insert(&mut self, hash: BlockHash, node: BlockNode) {
+        match self.positions.get(&hash) {
+            Some(&position) => self.nodes[position as usize] = node,
+            None => {
+                self.positions.insert(hash, self.nodes.len() as u32);
+                self.nodes.push(node);
+            }
+        }
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut BlockNode> {
+        self.nodes.iter_mut()
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockTree {
     // The hashes of the canonical chain, indexed by height. The block the tree started from is not
     // stored, the first entry is the block after it, at `first_height`.
     canonical_hashes: Vec<BlockHash>,
     first_height: Height,
-    headers: HashMap<BlockHash, BlockNode>,
+    headers: NodeStore,
     active_tip: Tip,
     candidate_forks: Vec<Tip>,
     network: Network,
@@ -109,7 +155,7 @@ impl BlockTree {
         Self {
             canonical_hashes: Vec::new(),
             first_height: tip.height.increment(),
-            headers: HashMap::with_capacity(20_000),
+            headers: NodeStore::with_capacity(20_000),
             active_tip: tip,
             candidate_forks: Vec::with_capacity(2),
             network,
@@ -125,7 +171,7 @@ impl BlockTree {
             height,
             next_work_required: Some(genesis.header.bits),
         };
-        let headers = HashMap::with_capacity(20_000);
+        let headers = NodeStore::with_capacity(20_000);
         Self {
             canonical_hashes: Vec::new(),
             first_height: height.increment(),
@@ -992,8 +1038,9 @@ mod tests {
             std::mem::size_of::<BlockNode>()
         );
         println!(
-            "headers map: {} slots for {COUNT} headers",
-            tree.headers.capacity()
+            "position map: {} slots, node arena: {} slots, for {COUNT} headers",
+            tree.headers.positions.capacity(),
+            tree.headers.nodes.capacity()
         );
         println!(
             "whole tree: {:.1} MB live ({} bytes per header), {:.1} MB peak while building",

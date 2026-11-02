@@ -101,10 +101,10 @@ impl Peer {
         let start_time = Instant::now();
         // Tracked until this function returns, however it returns.
         #[cfg(feature = "stats")]
-        let stats_guard = self
-            .dialog
-            .stats
-            .register_peer(self.nonce.0, self.source.network_addr().0);
+        let stats_guard = {
+            let (addr, port) = self.source.network_addr();
+            self.dialog.stats.register_peer(self.nonce.0, addr, port)
+        };
         #[cfg(feature = "stats")]
         {
             self.stats = Some(stats_guard.handle());

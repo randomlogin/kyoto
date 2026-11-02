@@ -18,7 +18,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{extract::State, http::header, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::State,
+    http::header,
+    response::{Html, IntoResponse},
+    routing::get,
+    Router,
+};
 use bitcoin::p2p::address::AddrV2;
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -33,14 +39,26 @@ struct Counters {
 #[derive(Debug)]
 struct PeerEntry {
     addr: AddrV2,
+    port: u16,
     connected_at: Instant,
     counters: Counters,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Inner {
+    started_at: Instant,
     totals: Counters,
     peers: Mutex<HashMap<u32, Arc<PeerEntry>>>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            totals: Counters::default(),
+            peers: Mutex::default(),
+        }
+    }
 }
 
 /// A shared handle to the node's network statistics.
@@ -52,6 +70,8 @@ pub struct Stats {
 /// A point-in-time copy of the network statistics.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
+    /// How long the statistics have been tracked, which is the age of the node.
+    pub uptime: Duration,
     /// Total bytes read from peers since the node was built, including peers since disconnected.
     pub bytes_received: u64,
     /// Total bytes written to peers since the node was built, including peers since disconnected.
@@ -69,6 +89,8 @@ pub struct StatsSnapshot {
 pub struct PeerStats {
     /// The address of the peer.
     pub addr: AddrV2,
+    /// The port of the peer.
+    pub port: u16,
     /// How long the connection to this peer has been open.
     pub uptime: Duration,
     /// Bytes read from this peer on this connection.
@@ -93,6 +115,7 @@ impl Stats {
             .values()
             .map(|p| PeerStats {
                 addr: p.addr.clone(),
+                port: p.port,
                 uptime: p.connected_at.elapsed(),
                 bytes_received: p.counters.bytes_received.load(Ordering::Relaxed),
                 bytes_sent: p.counters.bytes_sent.load(Ordering::Relaxed),
@@ -101,6 +124,7 @@ impl Stats {
             })
             .collect();
         StatsSnapshot {
+            uptime: self.inner.started_at.elapsed(),
             bytes_received: totals.bytes_received.load(Ordering::Relaxed),
             bytes_sent: totals.bytes_sent.load(Ordering::Relaxed),
             messages_received: totals.messages_received.load(Ordering::Relaxed),
@@ -110,9 +134,10 @@ impl Stats {
     }
 
     // Start tracking a connection. The peer is removed again when the guard drops.
-    pub(crate) fn register_peer(&self, id: u32, addr: AddrV2) -> PeerStatsGuard {
+    pub(crate) fn register_peer(&self, id: u32, addr: AddrV2, port: u16) -> PeerStatsGuard {
         let entry = Arc::new(PeerEntry {
             addr,
+            port,
             connected_at: Instant::now(),
             counters: Counters::default(),
         });
@@ -218,19 +243,51 @@ impl Stats {
         for peer in &snapshot.peers {
             out.push_str(&format!(
                 "kyoto_peer_uptime_seconds{{addr=\"{}\"}} {}\n",
-                escape_label(&addr_label(&peer.addr)),
+                escape_label(&addr_label(&peer.addr, peer.port)),
                 peer.uptime.as_secs()
             ));
         }
         out
     }
+
+    /// The statistics as JSON, the format the page served at `/` reads.
+    pub fn render_json(&self) -> String {
+        let snapshot = self.snapshot();
+        let peers: Vec<String> = snapshot
+            .peers
+            .iter()
+            .map(|peer| {
+                format!(
+                    "{{\"addr\":\"{}\",\"uptime_seconds\":{},\"bytes_received\":{},\
+                     \"bytes_sent\":{},\"messages_received\":{},\"messages_sent\":{}}}",
+                    escape_json(&addr_label(&peer.addr, peer.port)),
+                    peer.uptime.as_secs(),
+                    peer.bytes_received,
+                    peer.bytes_sent,
+                    peer.messages_received,
+                    peer.messages_sent
+                )
+            })
+            .collect();
+        format!(
+            "{{\"uptime_seconds\":{},\"connected_peers\":{},\"bytes_received\":{},\
+             \"bytes_sent\":{},\"messages_received\":{},\"messages_sent\":{},\"peers\":[{}]}}",
+            snapshot.uptime.as_secs(),
+            snapshot.peers.len(),
+            snapshot.bytes_received,
+            snapshot.bytes_sent,
+            snapshot.messages_received,
+            snapshot.messages_sent,
+            peers.join(",")
+        )
+    }
 }
 
-fn addr_label(addr: &AddrV2) -> String {
+fn addr_label(addr: &AddrV2, port: u16) -> String {
     match addr {
-        AddrV2::Ipv4(ip) => ip.to_string(),
-        AddrV2::Ipv6(ip) => ip.to_string(),
-        other => format!("{other:?}"),
+        AddrV2::Ipv4(ip) => format!("{ip}:{port}"),
+        AddrV2::Ipv6(ip) => format!("[{ip}]:{port}"),
+        other => format!("{other:?}:{port}"),
     }
 }
 
@@ -242,6 +299,20 @@ fn escape_label(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
+// Quotes, backslashes and control characters cannot appear raw inside a JSON string.
+fn escape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 async fn metrics(State(stats): State<Stats>) -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -249,8 +320,21 @@ async fn metrics(State(stats): State<Stats>) -> impl IntoResponse {
     )
 }
 
+async fn api_stats(State(stats): State<Stats>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        stats.render_json(),
+    )
+}
+
+async fn page() -> impl IntoResponse {
+    Html(include_str!("stats_page.html"))
+}
+
 fn router(stats: Stats) -> Router {
     Router::new()
+        .route("/", get(page))
+        .route("/api/stats", get(api_stats))
         .route("/metrics", get(metrics))
         .with_state(stats)
 }
@@ -264,14 +348,15 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Serve `GET /metrics` on `addr` until the returned handle is dropped.
+/// Serve the statistics on `addr` until the returned handle is dropped: `GET /metrics` for
+/// Prometheus, `GET /api/stats` as JSON and a small page that reads it at `GET /`.
 ///
 /// If the address cannot be bound the node carries on without the endpoint.
 pub(crate) fn spawn_server(addr: SocketAddr, stats: Stats) -> ServerHandle {
     ServerHandle(tokio::spawn(async move {
         match TcpListener::bind(addr).await {
             Ok(listener) => {
-                crate::debug!(format!("Serving statistics on http://{addr}/metrics"));
+                crate::debug!(format!("Serving statistics on http://{addr}/"));
                 let _ = axum::serve(listener, router(stats)).await;
             }
             Err(e) => {
@@ -304,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn serves_prometheus_metrics() {
         let stats = Stats::default();
-        let peer = stats.register_peer(1, addr(7));
+        let peer = stats.register_peer(1, addr(7), 8333);
         peer.handle().record_received(1234, 3);
         peer.handle().record_sent(56, 2);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,13 +419,50 @@ mod tests {
         );
         assert!(response.contains("kyoto_connected_peers 1\n"), "{response}");
         assert!(
-            response.contains("kyoto_peer_uptime_seconds{addr=\"10.0.0.7\"} "),
+            response.contains("kyoto_peer_uptime_seconds{addr=\"10.0.0.7:8333\"}"),
             "{response}"
         );
 
         let missing = http_get(bound, "/other").await;
         assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn serves_page_and_json() {
+        let stats = Stats::default();
+        let peer = stats.register_peer(1, addr(7), 8333);
+        peer.handle().record_received(1234, 3);
+        peer.handle().record_sent(56, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router(stats)).await;
+        });
+
+        let index = http_get(bound, "/").await;
+        assert!(index.starts_with("HTTP/1.1 200"), "{index}");
+        assert!(index.contains("text/html"), "{index}");
+        assert!(index.contains("/api/stats"), "{index}");
+
+        let json = http_get(bound, "/api/stats").await;
+        assert!(json.starts_with("HTTP/1.1 200"), "{json}");
+        assert!(json.contains("application/json"), "{json}");
+        assert!(json.contains("\"connected_peers\":1,"), "{json}");
+        assert!(json.contains("\"bytes_received\":1234,"), "{json}");
+        assert!(
+            json.contains(
+                "{\"addr\":\"10.0.0.7:8333\",\"uptime_seconds\":0,\"bytes_received\":1234,\
+                 \"bytes_sent\":56,\"messages_received\":3,\"messages_sent\":2}"
+            ),
+            "{json}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(escape_json("a\"b\\c\nd"), "a\\\"b\\\\c\\u000ad");
     }
 
     #[test]
@@ -351,8 +473,8 @@ mod tests {
     #[test]
     fn totals_outlive_peers() {
         let stats = Stats::default();
-        let a = stats.register_peer(1, addr(1));
-        let b = stats.register_peer(2, addr(2));
+        let a = stats.register_peer(1, addr(1), 8333);
+        let b = stats.register_peer(2, addr(2), 8333);
         a.handle().record_received(100, 2);
         a.handle().record_sent(10, 1);
         b.handle().record_received(50, 1);

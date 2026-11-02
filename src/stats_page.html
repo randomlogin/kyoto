@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kyoto node</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; background: #0d1117; color: #e6edf3; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  #status { color: #8b949e; font-size: 0.9rem; margin-bottom: 20px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .tile { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; }
+  .tile .label { font-size: 0.75rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.03em; }
+  .tile .value { font-size: 1.6rem; font-weight: 600; margin-top: 4px; }
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px 16px; overflow-x: auto; }
+  .panel h2 { font-size: 0.95rem; margin: 0 0 8px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  td, th { text-align: left; padding: 3px 6px; white-space: nowrap; }
+  .num { text-align: right; }
+</style>
+</head>
+<body>
+<h1>Kyoto node</h1>
+<div id="status">loading...</div>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="panel">
+  <h2>Connected peers</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>address</th><th class="num">uptime</th>
+        <th class="num">received</th><th class="num">sent</th>
+        <th class="num">msgs in</th><th class="num">msgs out</th>
+      </tr>
+    </thead>
+    <tbody id="peer-body"></tbody>
+  </table>
+</div>
+
+<script>
+const tileDefs = [
+  ["connected_peers", "Connected peers", v => v.connected_peers],
+  ["bytes_received", "Received", v => fmtBytes(v.bytes_received)],
+  ["bytes_sent", "Sent", v => fmtBytes(v.bytes_sent)],
+  ["messages_received", "Messages in", v => v.messages_received.toLocaleString()],
+  ["messages_sent", "Messages out", v => v.messages_sent.toLocaleString()],
+];
+document.getElementById("tiles").innerHTML = tileDefs.map(([id, label]) =>
+  `<div class="tile"><div class="label">${label}</div><div class="value" id="tile-${id}">--</div></div>`
+).join("");
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  return (d ? `${d}d ` : "") + `${h}h ${m}m ${sec}s`;
+}
+
+function fmtBytes(n) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${i ? n.toFixed(1) : n} ${units[i]}`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/stats");
+    const data = await res.json();
+    document.getElementById("status").textContent = `uptime: ${fmtUptime(data.uptime_seconds)}`;
+    for (const [id, , fn] of tileDefs) {
+      document.getElementById(`tile-${id}`).textContent = fn(data);
+    }
+    document.getElementById("peer-body").innerHTML = data.peers.length
+      ? data.peers.map(p =>
+          `<tr><td>${esc(p.addr)}</td><td class="num">${fmtUptime(p.uptime_seconds)}</td>` +
+          `<td class="num">${fmtBytes(p.bytes_received)}</td><td class="num">${fmtBytes(p.bytes_sent)}</td>` +
+          `<td class="num">${p.messages_received.toLocaleString()}</td><td class="num">${p.messages_sent.toLocaleString()}</td></tr>`
+        ).join("")
+      : "<tr><td colspan=6>no peers connected</td></tr>";
+  } catch (e) {
+    document.getElementById("status").textContent = "node unreachable";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

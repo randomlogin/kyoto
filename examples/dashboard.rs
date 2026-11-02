@@ -29,7 +29,8 @@ use axum::{
 use bip157::chain::{BlockHeaderChanges, ChainState};
 use bip157::messages::{Event, Warning};
 use bip157::{builder::Builder, chain::checkpoints::HashCheckpoint, Client, Info, Requester};
-use bip157::{Address, BlockHash, Magic, Network, ServiceFlags, Stats, TrustedPeer};
+use bip157::{BlockHash, Magic, Network, ServiceFlags, Stats, TrustedPeer};
+use bitcoin::Address;
 use bitcoin::p2p::address::AddrV2;
 use prometheus::{GaugeVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
 use rusqlite::{params, Connection};

@@ -438,10 +438,14 @@ impl PeerMap {
     // This peer misbehaved in some way.
     pub async fn ban(&mut self, nonce: PeerId, reason: DisconnectReason) {
         if let Some(peer) = self.map.get(&nonce) {
-            let addr = peer.record.network_addr().0;
+            let (addr, _port) = peer.record.network_addr();
             let mut db = self.db.lock().await;
             db.ban(&peer.record);
             drop(db);
+            #[cfg(feature = "stats")]
+            self.dialog
+                .stats
+                .note_ban(addr.clone(), _port, reason.clone());
             self.dialog
                 .send_warning(Warning::PeerBanned { addr, reason });
         }

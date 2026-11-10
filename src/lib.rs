@@ -64,7 +64,7 @@ pub mod node;
 pub mod stats;
 #[cfg(feature = "stats")]
 #[doc(inline)]
-pub use stats::{PeerStats, Stats, StatsSnapshot};
+pub use stats::{BanRecord, PeerStats, Stats, StatsSnapshot};
 // Loopback only: the endpoint has no authentication.
 #[cfg(feature = "stats")]
 const DEFAULT_STATS_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9332);

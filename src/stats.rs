@@ -33,6 +33,22 @@ use crate::DisconnectReason;
 // How many ended connections are remembered. The oldest are dropped first.
 const HISTORY_CAPACITY: usize = 200;
 
+// How many bans are remembered. The oldest are dropped first.
+const BAN_CAPACITY: usize = 200;
+
+/// A peer that was banned: removed from the address tables because it misbehaved.
+#[derive(Debug, Clone)]
+pub struct BanRecord {
+    /// When the peer was banned.
+    pub banned_at: SystemTime,
+    /// The address of the peer.
+    pub addr: AddrV2,
+    /// The port of the peer.
+    pub port: u16,
+    /// Why the peer was banned.
+    pub reason: DisconnectReason,
+}
+
 #[derive(Debug, Default)]
 struct Counters {
     bytes_received: AtomicU64,
@@ -64,6 +80,9 @@ struct Inner {
     disconnects: Mutex<BTreeMap<&'static str, u64>>,
     // The height of the header chain, 0 until the node has announced one.
     tip_height: AtomicU32,
+    // Peers that were banned, oldest first, and how many were banned in all.
+    bans: Mutex<VecDeque<BanRecord>>,
+    bans_total: AtomicU64,
 }
 
 impl Default for Inner {
@@ -76,6 +95,8 @@ impl Default for Inner {
             next_record_id: AtomicU64::new(1),
             disconnects: Mutex::default(),
             tip_height: AtomicU32::new(0),
+            bans: Mutex::default(),
+            bans_total: AtomicU64::new(0),
         }
     }
 }
@@ -198,6 +219,39 @@ impl Stats {
             .filter(|record| record.id > id)
             .cloned()
             .collect()
+    }
+
+    /// The peers that were banned, oldest first. Only the most recent ones are remembered; see
+    /// [`Stats::bans_total`] for how many there were in all.
+    pub fn bans(&self) -> Vec<BanRecord> {
+        self.inner
+            .bans
+            .lock()
+            .expect("stats lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// How many peers have been banned since the node was built, including the ones no longer
+    /// remembered by [`Stats::bans`].
+    pub fn bans_total(&self) -> u64 {
+        self.inner.bans_total.load(Ordering::Relaxed)
+    }
+
+    // This peer was banned.
+    pub(crate) fn note_ban(&self, addr: AddrV2, port: u16, reason: DisconnectReason) {
+        self.inner.bans_total.fetch_add(1, Ordering::Relaxed);
+        let mut bans = self.inner.bans.lock().expect("stats lock poisoned");
+        if bans.len() >= BAN_CAPACITY {
+            bans.pop_front();
+        }
+        bans.push_back(BanRecord {
+            banned_at: SystemTime::now(),
+            addr,
+            port,
+            reason,
+        });
     }
 
     // Remember why the connected peer at `addr` is going away, unless a reason is already known.
@@ -367,6 +421,12 @@ impl Stats {
             ));
         }
         out.push_str(&format!(
+            "# HELP kyoto_peers_banned_total Peers banned for misbehaving.\n\
+             # TYPE kyoto_peers_banned_total counter\n\
+             kyoto_peers_banned_total {}\n",
+            self.bans_total()
+        ));
+        out.push_str(&format!(
             "# HELP kyoto_connected_peers Peers connected right now.\n\
              # TYPE kyoto_connected_peers gauge\n\
              kyoto_connected_peers {}\n",
@@ -427,10 +487,25 @@ impl Stats {
                 )
             })
             .collect();
+        let banned: Vec<String> = self
+            .bans()
+            .iter()
+            .map(|ban| {
+                format!(
+                    "{{\"addr\":\"{}\",\"banned_at\":{},\"reason_kind\":\"{}\",\"reason\":\"{}\"}}",
+                    escape_json(&addr_label(&ban.addr, ban.port)),
+                    ban.banned_at
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs()),
+                    ban.reason.kind(),
+                    escape_json(&ban.reason.to_string())
+                )
+            })
+            .collect();
         format!(
             "{{\"uptime_seconds\":{},\"connected_peers\":{},\"bytes_received\":{},\
              \"bytes_sent\":{},\"messages_received\":{},\"messages_sent\":{},\
-             \"tip_height\":{},\"peers\":[{}]}}",
+             \"tip_height\":{},\"peers\":[{}],\"banned_total\":{},\"banned\":[{}]}}",
             snapshot.uptime.as_secs(),
             snapshot.peers.len(),
             snapshot.bytes_received,
@@ -440,7 +515,9 @@ impl Stats {
             snapshot
                 .tip_height
                 .map_or("null".to_string(), |height| height.to_string()),
-            peers.join(",")
+            peers.join(","),
+            self.bans_total(),
+            banned.join(",")
         )
     }
 
@@ -677,6 +754,37 @@ mod tests {
     #[test]
     fn json_strings_are_escaped() {
         assert_eq!(escape_json("a\"b\\c\nd"), "a\\\"b\\\\c\\u000ad");
+    }
+
+    #[test]
+    fn bans_are_listed_counted_and_trimmed() {
+        let stats = Stats::default();
+        assert_eq!(stats.bans_total(), 0);
+        assert!(stats
+            .render_json()
+            .contains("\"banned_total\":0,\"banned\":[]"));
+        stats.note_ban(
+            addr(7),
+            38333,
+            DisconnectReason::ProtocolViolation("bad \"filter\"".to_string()),
+        );
+        let json = stats.render_json();
+        assert!(json.contains("\"banned_total\":1"), "{json}");
+        assert!(json.contains("\"addr\":\"10.0.0.7:38333\""), "{json}");
+        assert!(
+            json.contains("\"reason_kind\":\"protocol_violation\""),
+            "{json}"
+        );
+        assert!(json.contains("bad \\\"filter\\\""), "{json}");
+        assert!(stats
+            .render_prometheus()
+            .contains("kyoto_peers_banned_total 1\n"));
+        // The list is capped, the total is not.
+        for i in 0..(BAN_CAPACITY + 5) {
+            stats.note_ban(addr(8), i as u16, DisconnectReason::Timeout);
+        }
+        assert_eq!(stats.bans().len(), BAN_CAPACITY);
+        assert_eq!(stats.bans_total(), BAN_CAPACITY as u64 + 6);
     }
 
     #[test]

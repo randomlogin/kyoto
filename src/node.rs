@@ -414,6 +414,10 @@ impl Node {
                 if last_block.stale() {
                     self.dialog.send_warning(Warning::PotentialStaleTip);
                     crate::debug!("Disconnecting from remote nodes to find new connections");
+                    #[cfg(feature = "stats")]
+                    self.dialog
+                        .stats
+                        .note_disconnect_all(DisconnectReason::StaleTip);
                     self.peer_map.broadcast(MainThreadMessage::Disconnect);
                     last_block.reset();
                 }

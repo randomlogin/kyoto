@@ -156,8 +156,41 @@ pub enum DisconnectReason {
     MaxConnectionTimeExceeded,
     /// An established connection ended: the peer hung up, or reading from it failed.
     ConnectionClosed,
+    /// The connection ended on an error while talking to the peer, such as a failed write.
+    Error(String),
+    /// The node closed the connection because it no longer needed it, such as when a gossip
+    /// subscription ended.
+    Requested,
+    /// No new block was seen for a long time, so the node dropped its connections to look for
+    /// fresher peers.
+    StaleTip,
+    /// The node stopped, so the connection was closed with it.
+    Shutdown,
+    /// The connection ended and no reason was recorded for it. This is what remains when the
+    /// connection's task was aborted, which happens to a peer that stopped reading its messages.
+    Unknown,
     /// The peer sent a peer-to-peer message that violated the expected protocol or sync state.
     ProtocolViolation(String),
+}
+
+impl DisconnectReason {
+    /// A short, stable name for the kind of reason, without the details that vary between peers.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DisconnectReason::Timeout => "timeout",
+            DisconnectReason::ConnectFailed => "connect_failed",
+            DisconnectReason::OutdatedVersion => "outdated_version",
+            DisconnectReason::NoCompactFilterSupport => "no_compact_filters",
+            DisconnectReason::MaxConnectionTimeExceeded => "max_connection_time",
+            DisconnectReason::ConnectionClosed => "connection_closed",
+            DisconnectReason::Error(_) => "error",
+            DisconnectReason::Requested => "requested",
+            DisconnectReason::StaleTip => "stale_tip",
+            DisconnectReason::Shutdown => "shutdown",
+            DisconnectReason::Unknown => "unknown",
+            DisconnectReason::ProtocolViolation(_) => "protocol_violation",
+        }
+    }
 }
 
 impl core::fmt::Display for DisconnectReason {
@@ -173,6 +206,13 @@ impl core::fmt::Display for DisconnectReason {
                 write!(f, "maximum connection time exceeded")
             }
             DisconnectReason::ConnectionClosed => write!(f, "connection closed"),
+            DisconnectReason::Error(err) => write!(f, "connection error: {err}"),
+            DisconnectReason::Requested => write!(f, "closed by the node, no longer needed"),
+            DisconnectReason::StaleTip => {
+                write!(f, "no new block for a long time, finding new peers")
+            }
+            DisconnectReason::Shutdown => write!(f, "the node stopped"),
+            DisconnectReason::Unknown => write!(f, "ended for an unknown reason"),
             DisconnectReason::ProtocolViolation(reason) => write!(f, "{reason}"),
         }
     }

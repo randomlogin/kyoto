@@ -478,10 +478,22 @@ impl Dialog {
     }
 
     fn send_warning(&self, warning: Warning) {
+        // The peer is still tracked at this point, so its history record gets the reason.
+        #[cfg(feature = "stats")]
+        // A banned peer is disconnected right after, and the ban carries the reason.
+        if let Warning::PeerDisconnected { addr, reason } | Warning::PeerBanned { addr, reason } =
+            &warning
+        {
+            self.stats.note_disconnect(addr, reason);
+        }
         let _ = self.warn_tx.try_send(warning);
     }
 
     fn send_info(&self, info: Info) {
+        #[cfg(feature = "stats")]
+        if let Info::NewChainHeight(height) = &info {
+            self.stats.set_tip_height(*height);
+        }
         let _ = self.info_tx.try_send(info);
     }
 

@@ -20,7 +20,7 @@ use tokio::{
 use crate::network::gossip::TransactionCheck;
 use crate::network::RelayPolicy;
 #[cfg(feature = "stats")]
-use crate::stats::PeerStatsHandle;
+use crate::stats::{PeerStatsGuard, PeerStatsHandle};
 use crate::{
     broadcaster::{BroadcastQueue, TxIdentifier},
     messages::{DisconnectReason, Warning},
@@ -98,7 +98,6 @@ impl Peer {
         connection: TcpStream,
         is_proxy_connection: bool,
     ) -> Result<(), PeerError> {
-        let start_time = Instant::now();
         // Tracked until this function returns, however it returns.
         #[cfg(feature = "stats")]
         let stats_guard = {
@@ -109,6 +108,30 @@ impl Peer {
         {
             self.stats = Some(stats_guard.handle());
         }
+        #[cfg(feature = "stats")]
+        let result = self
+            .run_connection(connection, is_proxy_connection, &stats_guard)
+            .await;
+        #[cfg(not(feature = "stats"))]
+        let result = self.run_connection(connection, is_proxy_connection).await;
+        // Most exits say why through a warning. An error that bubbled up does not, so it is
+        // noted here, before the guard drops and turns the connection into a history record.
+        #[cfg(feature = "stats")]
+        if let Err(e) = &result {
+            stats_guard
+                .handle()
+                .note_disconnect(DisconnectReason::Error(e.to_string()));
+        }
+        result
+    }
+
+    async fn run_connection(
+        &mut self,
+        connection: TcpStream,
+        is_proxy_connection: bool,
+        #[cfg(feature = "stats")] stats_guard: &PeerStatsGuard,
+    ) -> Result<(), PeerError> {
+        let start_time = Instant::now();
         let (tx, mut rx) = mpsc::channel(32);
         let reader_tx = tx.clone();
         let (reader, mut writer) = connection.into_split();
@@ -116,10 +139,11 @@ impl Peer {
         // If a peer signals for V2 we will use it, otherwise just use plaintext.
         let (mut outbound_messages, mut peer_reader) =
             if self.source.service_flags().has(ServiceFlags::P2P_V2) && !is_proxy_connection {
+                // A handshake that takes too long fails the same way as one that goes wrong.
                 let handshake_result =
                     tokio::time::timeout(V2_HANDSHAKE_TIMEOUT, self.try_handshake(writer, reader))
                         .await
-                        .map_err(|_| PeerError::HandshakeFailed)?;
+                        .unwrap_or(Err(PeerError::HandshakeFailed));
                 if handshake_result.is_err() {
                     self.dialog.send_warning(Warning::PeerDisconnected {
                         addr: self.source.network_addr().0,
@@ -175,7 +199,14 @@ impl Peer {
                 let reason = match read_handle.await {
                     Ok(Err(ReaderError::Io(_))) => Some(DisconnectReason::ConnectionClosed),
                     // The node stopped listening to this peer, there is nobody to tell.
-                    Ok(Err(ReaderError::ChannelClosed)) | Ok(Ok(())) | Err(_) => None,
+                    Ok(Err(ReaderError::ChannelClosed)) | Ok(Ok(())) => {
+                        self.note_exit(DisconnectReason::Shutdown);
+                        None
+                    }
+                    Err(e) => {
+                        self.note_exit(DisconnectReason::Error(format!("the reader failed: {e}")));
+                        None
+                    }
                     Ok(Err(e)) => Some(DisconnectReason::ProtocolViolation(e.to_string())),
                 };
                 if let Some(reason) = reason {
@@ -253,7 +284,11 @@ impl Peer {
                                 },
                             }
                         },
-                        None => return Ok(()),
+                        // The node dropped its end of the channel: it has stopped.
+                        None => {
+                            self.note_exit(DisconnectReason::Shutdown);
+                            return Ok(());
+                        }
                     }
                 }
                 _ = interval.tick() => continue,
@@ -277,7 +312,7 @@ impl Peer {
         match message {
             ReaderMessage::Version(version) => {
                 if !self.message_state.receive_version() {
-                    return Err(PeerError::DisconnectCommand);
+                    return Err(self.violation("sent more than one version message"));
                 }
                 self.main_thread_sender
                     .send(PeerThreadMessage {
@@ -415,11 +450,11 @@ impl Peer {
             }
             ReaderMessage::Verack => {
                 if self.message_state.version_handshake.is_complete() {
-                    return Err(PeerError::DisconnectCommand);
+                    return Err(self.violation("sent a verack after the handshake was complete"));
                 }
                 // Not expecting two acks
                 if self.message_state.verack.got_ack {
-                    return Err(PeerError::DisconnectCommand);
+                    return Err(self.violation("sent more than one verack"));
                 }
                 self.message_state.verack.got_ack();
                 if self.message_state.verack.both_acks() {
@@ -437,7 +472,7 @@ impl Peer {
                 if self.message_state.ping_state.check_pong(nonce) {
                     Ok(())
                 } else {
-                    Err(PeerError::DisconnectCommand)
+                    Err(self.violation("answered a ping with the wrong nonce"))
                 }
             }
             ReaderMessage::FeeFilter(fee) => {
@@ -452,13 +487,16 @@ impl Peer {
             ReaderMessage::Reject(payload) => {
                 if self.message_state.unknown_rejection(payload.wtxid) {
                     self.dialog.send_warning(Warning::UnsolicitedMessage);
-                    return Err(PeerError::DisconnectCommand);
+                    return Err(self.violation("rejected a transaction we did not send"));
                 }
                 self.dialog
                     .send_warning(Warning::TransactionRejected { payload });
                 Ok(())
             }
-            ReaderMessage::Disconnect => Err(PeerError::DisconnectCommand),
+            // The reader only asks for this when a message breaks a protocol limit.
+            ReaderMessage::Disconnect => {
+                Err(self.violation("sent a message that is too large or invalid"))
+            }
         }
     }
 
@@ -551,6 +589,20 @@ impl Peer {
             MainThreadMessage::Disconnect => return Err(PeerError::DisconnectCommand),
         }
         Ok(())
+    }
+
+    // The peer broke the protocol: note why, and the error that ends the connection.
+    fn violation(&self, why: &str) -> PeerError {
+        self.note_exit(DisconnectReason::ProtocolViolation(why.into()));
+        PeerError::DisconnectCommand
+    }
+
+    // Tell the statistics why this connection ends. Does nothing without the `stats` feature.
+    fn note_exit(&self, _reason: DisconnectReason) {
+        #[cfg(feature = "stats")]
+        if let Some(stats) = &self.stats {
+            stats.note_disconnect(_reason);
+        }
     }
 
     async fn write_bytes<W>(&self, writer: &mut W, message: Vec<u8>) -> Result<(), PeerError>

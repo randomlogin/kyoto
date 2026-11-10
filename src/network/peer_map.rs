@@ -482,6 +482,10 @@ impl PeerMap {
                 active_peer,
             } => {
                 if let Some(peer) = active_peer {
+                    #[cfg(feature = "stats")]
+                    self.dialog
+                        .stats
+                        .note_disconnect_id(peer.id.0, DisconnectReason::Requested);
                     deliver(&peer.ptx, &peer.handle, MainThreadMessage::Disconnect);
                 }
                 self.gossip = GossipSubscriptionStatus::Unsubscribed;

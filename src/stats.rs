@@ -9,17 +9,17 @@
 //! prefix + encrypted packet). The V2 handshake is not counted.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use axum::{
-    extract::State,
+    extract::{RawQuery, State},
     http::header,
     response::{Html, IntoResponse},
     routing::get,
@@ -27,6 +27,11 @@ use axum::{
 };
 use bitcoin::p2p::address::AddrV2;
 use tokio::{net::TcpListener, task::JoinHandle};
+
+use crate::DisconnectReason;
+
+// How many ended connections are remembered. The oldest are dropped first.
+const HISTORY_CAPACITY: usize = 200;
 
 #[derive(Debug, Default)]
 struct Counters {
@@ -41,7 +46,10 @@ struct PeerEntry {
     addr: AddrV2,
     port: u16,
     connected_at: Instant,
+    connected_at_wall: SystemTime,
     counters: Counters,
+    // Why the connection ended, set by whoever decides to end it. The first reason wins.
+    reason: Mutex<Option<DisconnectReason>>,
 }
 
 #[derive(Debug)]
@@ -49,6 +57,13 @@ struct Inner {
     started_at: Instant,
     totals: Counters,
     peers: Mutex<HashMap<u32, Arc<PeerEntry>>>,
+    // Connections that have ended, oldest first.
+    history: Mutex<VecDeque<PeerRecord>>,
+    next_record_id: AtomicU64,
+    // Every ended connection by the kind of its reason, which unlike the history is never trimmed.
+    disconnects: Mutex<BTreeMap<&'static str, u64>>,
+    // The height of the header chain, 0 until the node has announced one.
+    tip_height: AtomicU32,
 }
 
 impl Default for Inner {
@@ -57,6 +72,10 @@ impl Default for Inner {
             started_at: Instant::now(),
             totals: Counters::default(),
             peers: Mutex::default(),
+            history: Mutex::default(),
+            next_record_id: AtomicU64::new(1),
+            disconnects: Mutex::default(),
+            tip_height: AtomicU32::new(0),
         }
     }
 }
@@ -80,6 +99,8 @@ pub struct StatsSnapshot {
     pub messages_received: u64,
     /// Total peer-to-peer messages sent since the node was built.
     pub messages_sent: u64,
+    /// The height of the header chain, or `None` before the node has announced one.
+    pub tip_height: Option<u32>,
     /// The peers connected right now.
     pub peers: Vec<PeerStats>,
 }
@@ -101,6 +122,33 @@ pub struct PeerStats {
     pub messages_received: u64,
     /// Messages sent to this peer on this connection.
     pub messages_sent: u64,
+}
+
+/// A connection to a peer that has ended.
+#[derive(Debug, Clone)]
+pub struct PeerRecord {
+    /// Increases with every ended connection, so a reader can ask for records after the last one it
+    /// saw with [`Stats::history_since`] and miss none unless more than the buffer holds ended in
+    /// between.
+    pub id: u64,
+    /// The address of the peer.
+    pub addr: AddrV2,
+    /// The port of the peer.
+    pub port: u16,
+    /// When the connection was opened.
+    pub connected_at: SystemTime,
+    /// How long the connection stayed open.
+    pub lived: Duration,
+    /// Bytes read from this peer on this connection.
+    pub bytes_received: u64,
+    /// Bytes written to this peer on this connection.
+    pub bytes_sent: u64,
+    /// Messages received from this peer on this connection.
+    pub messages_received: u64,
+    /// Messages sent to this peer on this connection.
+    pub messages_sent: u64,
+    /// Why the connection ended.
+    pub reason: DisconnectReason,
 }
 
 impl Stats {
@@ -129,7 +177,50 @@ impl Stats {
             bytes_sent: totals.bytes_sent.load(Ordering::Relaxed),
             messages_received: totals.messages_received.load(Ordering::Relaxed),
             messages_sent: totals.messages_sent.load(Ordering::Relaxed),
+            tip_height: Some(self.inner.tip_height.load(Ordering::Relaxed)).filter(|&h| h != 0),
             peers,
+        }
+    }
+
+    // The header chain now has this height. It also goes down after a reorganization.
+    pub(crate) fn set_tip_height(&self, height: u32) {
+        self.inner.tip_height.store(height, Ordering::Relaxed);
+    }
+
+    /// The connections that have ended, oldest first, with an id greater than `id`. Pass `0` to get
+    /// everything that is remembered, or the id of the last record seen to get only newer ones.
+    pub fn history_since(&self, id: u64) -> Vec<PeerRecord> {
+        self.inner
+            .history
+            .lock()
+            .expect("stats lock poisoned")
+            .iter()
+            .filter(|record| record.id > id)
+            .cloned()
+            .collect()
+    }
+
+    // Remember why the connected peer at `addr` is going away, unless a reason is already known.
+    pub(crate) fn note_disconnect(&self, addr: &AddrV2, reason: &DisconnectReason) {
+        let peers = self.inner.peers.lock().expect("stats lock poisoned");
+        for entry in peers.values().filter(|entry| &entry.addr == addr) {
+            entry.set_reason(reason.clone());
+        }
+    }
+
+    // Remember why the connection with this id is going away, unless a reason is already known.
+    pub(crate) fn note_disconnect_id(&self, id: u32, reason: DisconnectReason) {
+        let peers = self.inner.peers.lock().expect("stats lock poisoned");
+        if let Some(entry) = peers.get(&id) {
+            entry.set_reason(reason);
+        }
+    }
+
+    // Remember why every connection is going away, unless a reason is already known.
+    pub(crate) fn note_disconnect_all(&self, reason: DisconnectReason) {
+        let peers = self.inner.peers.lock().expect("stats lock poisoned");
+        for entry in peers.values() {
+            entry.set_reason(reason.clone());
         }
     }
 
@@ -139,7 +230,9 @@ impl Stats {
             addr,
             port,
             connected_at: Instant::now(),
+            connected_at_wall: SystemTime::now(),
             counters: Counters::default(),
+            reason: Mutex::new(None),
         });
         self.inner
             .peers
@@ -156,7 +249,16 @@ impl Stats {
     }
 }
 
-// Removes the peer from the live table on drop, whichever way the connection task exits.
+impl PeerEntry {
+    fn set_reason(&self, reason: DisconnectReason) {
+        if let Ok(mut slot) = self.reason.lock() {
+            slot.get_or_insert(reason);
+        }
+    }
+}
+
+// Moves the peer from the live table to the history on drop, whichever way the connection task
+// exits.
 pub(crate) struct PeerStatsGuard {
     id: u32,
     handle: PeerStatsHandle,
@@ -170,8 +272,37 @@ impl PeerStatsGuard {
 
 impl Drop for PeerStatsGuard {
     fn drop(&mut self) {
-        if let Ok(mut peers) = self.handle.inner.peers.lock() {
+        let inner = &self.handle.inner;
+        let entry = &self.handle.entry;
+        if let Ok(mut peers) = inner.peers.lock() {
             peers.remove(&self.id);
+        }
+        // Every way a connection ends is meant to say why. If one did not, this shows it.
+        let reason = entry
+            .reason
+            .lock()
+            .ok()
+            .and_then(|mut reason| reason.take())
+            .unwrap_or(DisconnectReason::Unknown);
+        if let Ok(mut disconnects) = inner.disconnects.lock() {
+            *disconnects.entry(reason.kind()).or_default() += 1;
+        }
+        if let Ok(mut history) = inner.history.lock() {
+            if history.len() == HISTORY_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(PeerRecord {
+                id: inner.next_record_id.fetch_add(1, Ordering::Relaxed),
+                addr: entry.addr.clone(),
+                port: entry.port,
+                connected_at: entry.connected_at_wall,
+                lived: entry.connected_at.elapsed(),
+                bytes_received: entry.counters.bytes_received.load(Ordering::Relaxed),
+                bytes_sent: entry.counters.bytes_sent.load(Ordering::Relaxed),
+                messages_received: entry.counters.messages_received.load(Ordering::Relaxed),
+                messages_sent: entry.counters.messages_sent.load(Ordering::Relaxed),
+                reason,
+            });
         }
     }
 }
@@ -184,6 +315,11 @@ pub(crate) struct PeerStatsHandle {
 }
 
 impl PeerStatsHandle {
+    // Remember why this connection is going away, unless a reason is already known.
+    pub(crate) fn note_disconnect(&self, reason: DisconnectReason) {
+        self.entry.set_reason(reason);
+    }
+
     pub(crate) fn record_received(&self, bytes: usize, messages: u64) {
         for c in [&self.entry.counters, &self.inner.totals] {
             c.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -247,6 +383,28 @@ impl Stats {
                 peer.uptime.as_secs()
             ));
         }
+        if let Some(height) = snapshot.tip_height {
+            out.push_str(&format!(
+                "# HELP kyoto_tip_height Height of the header chain.\n\
+                 # TYPE kyoto_tip_height gauge\n\
+                 kyoto_tip_height {height}\n"
+            ));
+        }
+        out.push_str(
+            "# HELP kyoto_peer_disconnects_total Ended peer connections, by the reason they ended.\n\
+             # TYPE kyoto_peer_disconnects_total counter\n",
+        );
+        for (reason, count) in self
+            .inner
+            .disconnects
+            .lock()
+            .expect("stats lock poisoned")
+            .iter()
+        {
+            out.push_str(&format!(
+                "kyoto_peer_disconnects_total{{reason=\"{reason}\"}} {count}\n"
+            ));
+        }
         out
     }
 
@@ -271,15 +429,50 @@ impl Stats {
             .collect();
         format!(
             "{{\"uptime_seconds\":{},\"connected_peers\":{},\"bytes_received\":{},\
-             \"bytes_sent\":{},\"messages_received\":{},\"messages_sent\":{},\"peers\":[{}]}}",
+             \"bytes_sent\":{},\"messages_received\":{},\"messages_sent\":{},\
+             \"tip_height\":{},\"peers\":[{}]}}",
             snapshot.uptime.as_secs(),
             snapshot.peers.len(),
             snapshot.bytes_received,
             snapshot.bytes_sent,
             snapshot.messages_received,
             snapshot.messages_sent,
+            snapshot
+                .tip_height
+                .map_or("null".to_string(), |height| height.to_string()),
             peers.join(",")
         )
+    }
+
+    /// The ended connections newer than `since` as JSON, the format served at
+    /// `/api/peers/history`. `connected_at` is in seconds since the Unix epoch.
+    pub fn render_history_json(&self, since: u64) -> String {
+        let records: Vec<String> = self
+            .history_since(since)
+            .iter()
+            .map(|record| {
+                let connected_at = record
+                    .connected_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs());
+                format!(
+                    "{{\"id\":{},\"addr\":\"{}\",\"connected_at\":{},\"lived_seconds\":{},\
+                     \"bytes_received\":{},\"bytes_sent\":{},\"messages_received\":{},\
+                     \"messages_sent\":{},\"reason_kind\":\"{}\",\"reason\":\"{}\"}}",
+                    record.id,
+                    escape_json(&addr_label(&record.addr, record.port)),
+                    connected_at,
+                    record.lived.as_secs(),
+                    record.bytes_received,
+                    record.bytes_sent,
+                    record.messages_received,
+                    record.messages_sent,
+                    record.reason.kind(),
+                    escape_json(&record.reason.to_string())
+                )
+            })
+            .collect();
+        format!("{{\"history\":[{}]}}", records.join(","))
     }
 }
 
@@ -327,6 +520,26 @@ async fn api_stats(State(stats): State<Stats>) -> impl IntoResponse {
     )
 }
 
+// `?since=<id>` limits the answer to connections that ended after the record with that id.
+async fn api_peers_history(
+    State(stats): State<Stats>,
+    RawQuery(query): RawQuery,
+) -> impl IntoResponse {
+    let since = query
+        .as_deref()
+        .and_then(|query| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("since="))
+        })
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        stats.render_history_json(since),
+    )
+}
+
 async fn page() -> impl IntoResponse {
     Html(include_str!("stats_page.html"))
 }
@@ -335,6 +548,7 @@ fn router(stats: Stats) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/api/stats", get(api_stats))
+        .route("/api/peers/history", get(api_peers_history))
         .route("/metrics", get(metrics))
         .with_state(stats)
 }
